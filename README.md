@@ -24,27 +24,21 @@ odd/even N) and accept a CUDA stream for asynchronous execution.
 
 - CUDA toolkit (tested with CUDA 12)
 - cuBLAS and cuSOLVER (included with CUDA toolkit)
-- CMake ≥ 3.18
-- Python ≥ 3.8 with [uv](https://docs.astral.sh/uv/)
-- PyTorch (CUDA build)
+- CMake >= 3.18
+- Python >= 3.8
+- [uv](https://docs.astral.sh/uv/)
 
 ## Install
 
 ```bash
-# Clone and enter the repo
 git clone <repo-url>
 cd curfp
-
-# Build C library + Python extension, create venv, install everything
 make
 ```
 
-This will:
-1. Create `.venv` with Python 3.14
-2. Install `pybind11` and `torch` into the venv
-3. Build `libcurfp.so` and `_curfp_C.so` via CMake
-4. Install the `.so` files into `curfp/`
-5. Run `pip install -e .` (editable install)
+This creates a `.venv` and installs the package (including `torch` and `pytest`)
+into it. The C library and Python extension are built automatically via
+[scikit-build-core](https://scikit-build-core.readthedocs.io/).
 
 To use a different Python version:
 
@@ -52,20 +46,20 @@ To use a different Python version:
 make PYTHON_VER=3.12
 ```
 
-Other useful targets:
-
-```bash
-make test       # run C++ tests (ctest) + Python tests
-make test-c     # C++ tests only
-make test-py    # Python tests only
-make clean      # remove build artefacts
-make distclean  # clean + remove .venv
-```
-
 To activate the venv for interactive use:
 
 ```bash
 source .venv/bin/activate
+```
+
+Other useful targets:
+
+```bash
+make venv       # create .venv only
+make test       # run Python tests (pytest)
+make test-c     # C++ tests only (ctest)
+make clean      # remove build artefacts
+make distclean  # clean + remove .venv
 ```
 
 ## Usage
