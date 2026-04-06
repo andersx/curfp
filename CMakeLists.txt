@@ -33,6 +33,10 @@ target_link_libraries(curfp
 # ---------------------------------------------------------------------------
 # Python extension (built by scikit-build-core or via -DCURFP_BUILD_PYTHON=ON)
 # ---------------------------------------------------------------------------
+# Auto-enable when driven by scikit-build-core (pip install)
+if(SKBUILD)
+    set(CURFP_BUILD_PYTHON ON CACHE BOOL "" FORCE)
+endif()
 option(CURFP_BUILD_PYTHON "Build Python extension" OFF)
 
 if(CURFP_BUILD_PYTHON)
