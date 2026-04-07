@@ -28,7 +28,7 @@ def test_n1_all_variants():
         for transr in transr_vals:
             for uplo in uplo_vals:
                 A = torch.tensor([val], dtype=torch.float32, device="cuda")
-                info = curfp.spftrf(h, transr, uplo, 1, A)
+                info = curfp.spftrf_raw(h, transr, uplo, 1, A)
 
                 assert info == 0, f"info={info} for transr={transr} uplo={uplo}"
                 result = A.cpu().item()
@@ -61,7 +61,7 @@ def test_n2_NL():
     exp_l11 = math.sqrt(a11 - exp_l10 ** 2)
 
     with curfp.Handle() as h:
-        info = curfp.spftrf(h, curfp.OP_N, curfp.FILL_LOWER, 2, A)
+        info = curfp.spftrf_raw(h, curfp.OP_N, curfp.FILL_LOWER, 2, A)
 
     assert info == 0, f"info={info}"
 
@@ -108,7 +108,7 @@ def test_n3_NL():
     exp_l22 = math.sqrt(a22 - exp_l20 ** 2 - exp_l21 ** 2)
 
     with curfp.Handle() as h:
-        info = curfp.spftrf(h, curfp.OP_N, curfp.FILL_LOWER, 3, A)
+        info = curfp.spftrf_raw(h, curfp.OP_N, curfp.FILL_LOWER, 3, A)
 
     assert info == 0, f"info={info}"
 
@@ -133,7 +133,7 @@ def test_not_positive_definite():
     # A = [[-1]] — not positive definite
     A = torch.tensor([-1.0], dtype=torch.float32, device="cuda")
     with curfp.Handle() as h:
-        info = curfp.spftrf(h, curfp.OP_N, curfp.FILL_LOWER, 1, A)
+        info = curfp.spftrf_raw(h, curfp.OP_N, curfp.FILL_LOWER, 1, A)
     assert info > 0, f"Expected info > 0 for non-SPD matrix, got {info}"
     print("test_not_positive_definite PASSED")
 
@@ -147,7 +147,7 @@ def test_stream():
     with curfp.Handle() as h:
         h.set_stream(stream)
         with torch.cuda.stream(stream):
-            info = curfp.spftrf(h, curfp.OP_N, curfp.FILL_LOWER, 1, A)
+            info = curfp.spftrf_raw(h, curfp.OP_N, curfp.FILL_LOWER, 1, A)
         torch.cuda.current_stream().wait_stream(stream)
 
     assert info == 0

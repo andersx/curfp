@@ -94,6 +94,26 @@ curfpStatus_t curfpSpftrf(
     int             *info      /* host pointer: 0 = success                     */
 );
 
+/* ---------------------------------------------------------------------------
+ * curfpSpftrs — Triangular solve using RFP Cholesky factor (single precision)
+ *
+ * Solves A * X = B where A is the RFP Cholesky factor from curfpSpftrf.
+ *   uplo=FILL_LOWER:  (L * L^T) * X = B
+ *   uplo=FILL_UPPER:  (U^T * U) * X = B
+ *
+ * B is (n × nrhs) column-major with leading dimension ldb, overwritten with X.
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpSpftrs(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    int              nrhs,
+    const float     *A,    /* device pointer, RFP Cholesky factor */
+    float           *B,    /* device pointer, (n × nrhs), overwritten with X */
+    int              ldb
+);
+
 #ifdef __cplusplus
 }
 #endif

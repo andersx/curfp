@@ -1,17 +1,136 @@
 /*
  * curfpSsfrk — Symmetric Rank-K update in RFP format (single precision)
  *
- * Direct translation of LAPACK ssfrk.f to CUDA using cuBLAS for the
- * underlying BLAS calls.  The RFP array C is partitioned into blocks;
- * pointer offsets follow the LAPACK reference source exactly, converting
- * from 1-based Fortran indexing (C(*)) to 0-based C pointers.
+ * Direct translation of LAPACK ssfrk.f to CUDA using cuBLAS.
  *
- * There are 8 RFP storage variants:
- *   N parity (odd/even) × transr (N/T) × uplo (L/U)
- * Each variant computes 2× cublasSsyrk + 1× cublasSgemm on the sub-blocks.
+ * There are 8 RFP storage variants: N parity × transr × uplo.
+ * Each variant computes 2× cublasSsyrk + 1× cublasSgemm on sub-blocks.
+ *
+ * Instead of 8 copy-pasted code blocks we parameterize the sub-block layout
+ * in a single struct and run one generic code path.
  */
 
 #include "curfp_internal.h"
+
+/* -------------------------------------------------------------------------
+ * Per-case parameters for the 3 cuBLAS calls.
+ *
+ * Notation (all pointer offsets in elements, not bytes):
+ *   C1   = C + off1   (first  ssyrk output: off-diagonal block)
+ *   C2   = C + off2   (second ssyrk output: diagonal block)
+ *   Cg   = C + offg   (sgemm output)
+ *   A2_n = A + a2_notrans  (second A block when trans=N, row offset)
+ *   A2_t = A + a2_trans    (second A block when trans=T, col offset × lda)
+ *
+ * sgemm computes: Cg := alpha * op(Ag1) * op(Ag2)^T + beta * Cg
+ * where (Ag1, Ag2) = (A1, A2) when gemm_a1_first=1, else (A2, A1).
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    /* ssyrk1: fill1, dim1 */
+    cublasFillMode_t  fill1;
+    int               dim1;
+    long              off1;    /* C offset for ssyrk1 */
+
+    /* ssyrk2: fill2, dim2 */
+    cublasFillMode_t  fill2;
+    int               dim2;
+    long              off2;    /* C offset for ssyrk2 */
+
+    /* sgemm */
+    int               gemm_m, gemm_n;   /* output dims of sgemm */
+    long              offg;             /* C offset for sgemm */
+    int               gemm_a1_first;   /* 1: (A1,A2), 0: (A2,A1) as sgemm (op(A), op(B)) */
+
+    /* A second-block offset */
+    long              a2_notrans;  /* A + a2_notrans when trans=N */
+    long              a2_trans_k;  /* A + a2_trans_k * lda when trans=T */
+
+    /* leading dimension of RFP sub-blocks */
+    int               ldc;
+} ssfrk_params_t;
+
+static void get_ssfrk_params(int nisodd, int normaltransr, int lower,
+                              int n, int n1, int n2, int nk,
+                              ssfrk_params_t *p)
+{
+    if (nisodd) {
+        if (normaltransr) {
+            p->ldc = n;
+            if (lower) {
+                /* Case 1: odd, TRANSR=N, UPLO=L */
+                p->fill1 = CUBLAS_FILL_MODE_LOWER; p->dim1 = n1; p->off1 = 0;
+                p->fill2 = CUBLAS_FILL_MODE_UPPER; p->dim2 = n2; p->off2 = n;
+                p->gemm_m = n2; p->gemm_n = n1; p->offg = n1;
+                p->gemm_a1_first = 0; /* sgemm(A2, A1) */
+                p->a2_notrans = n1; p->a2_trans_k = n1;
+            } else {
+                /* Case 2: odd, TRANSR=N, UPLO=U */
+                p->fill1 = CUBLAS_FILL_MODE_LOWER; p->dim1 = n1; p->off1 = n2;
+                p->fill2 = CUBLAS_FILL_MODE_UPPER; p->dim2 = n2; p->off2 = n1;
+                p->gemm_m = n1; p->gemm_n = n2; p->offg = 0;
+                p->gemm_a1_first = 1; /* sgemm(A1, A2) */
+                p->a2_notrans = n2 - 1; p->a2_trans_k = n2 - 1;
+            }
+        } else {
+            /* TRANSR=T */
+            if (lower) {
+                /* Case 3: odd, TRANSR=T, UPLO=L, ldc=n1 */
+                p->ldc = n1;
+                p->fill1 = CUBLAS_FILL_MODE_UPPER; p->dim1 = n1; p->off1 = 0;
+                p->fill2 = CUBLAS_FILL_MODE_LOWER; p->dim2 = n2; p->off2 = 1;
+                p->gemm_m = n1; p->gemm_n = n2; p->offg = (long)n1 * n1;
+                p->gemm_a1_first = 1; /* sgemm(A1, A2) */
+                p->a2_notrans = n1; p->a2_trans_k = n1;
+            } else {
+                /* Case 4: odd, TRANSR=T, UPLO=U, ldc=n2 */
+                p->ldc = n2;
+                p->fill1 = CUBLAS_FILL_MODE_UPPER; p->dim1 = n1; p->off1 = (long)n2 * n2;
+                p->fill2 = CUBLAS_FILL_MODE_LOWER; p->dim2 = n2; p->off2 = (long)n1 * n2;
+                p->gemm_m = n2; p->gemm_n = n1; p->offg = 0;
+                p->gemm_a1_first = 0; /* sgemm(A2, A1) */
+                p->a2_notrans = n1; p->a2_trans_k = n1;
+            }
+        }
+    } else {
+        /* Even N */
+        if (normaltransr) {
+            p->ldc = n + 1;
+            if (lower) {
+                /* Case 5: even, TRANSR=N, UPLO=L */
+                p->fill1 = CUBLAS_FILL_MODE_LOWER; p->dim1 = nk; p->off1 = 1;
+                p->fill2 = CUBLAS_FILL_MODE_UPPER; p->dim2 = nk; p->off2 = 0;
+                p->gemm_m = nk; p->gemm_n = nk; p->offg = nk + 1;
+                p->gemm_a1_first = 0; /* sgemm(A2, A1) */
+                p->a2_notrans = nk; p->a2_trans_k = nk;
+            } else {
+                /* Case 6: even, TRANSR=N, UPLO=U */
+                p->fill1 = CUBLAS_FILL_MODE_LOWER; p->dim1 = nk; p->off1 = nk + 1;
+                p->fill2 = CUBLAS_FILL_MODE_UPPER; p->dim2 = nk; p->off2 = nk;
+                p->gemm_m = nk; p->gemm_n = nk; p->offg = 0;
+                p->gemm_a1_first = 1; /* sgemm(A1, A2) */
+                p->a2_notrans = nk; p->a2_trans_k = nk;
+            }
+        } else {
+            /* TRANSR=T */
+            p->ldc = nk;
+            if (lower) {
+                /* Case 7: even, TRANSR=T, UPLO=L */
+                p->fill1 = CUBLAS_FILL_MODE_UPPER; p->dim1 = nk; p->off1 = nk;
+                p->fill2 = CUBLAS_FILL_MODE_LOWER; p->dim2 = nk; p->off2 = 0;
+                p->gemm_m = nk; p->gemm_n = nk; p->offg = (long)(nk + 1) * nk;
+                p->gemm_a1_first = 1; /* sgemm(A1, A2) */
+                p->a2_notrans = nk; p->a2_trans_k = nk;
+            } else {
+                /* Case 8: even, TRANSR=T, UPLO=U */
+                p->fill1 = CUBLAS_FILL_MODE_UPPER; p->dim1 = nk; p->off1 = (long)nk * (nk + 1);
+                p->fill2 = CUBLAS_FILL_MODE_LOWER; p->dim2 = nk; p->off2 = (long)nk * nk;
+                p->gemm_m = nk; p->gemm_n = nk; p->offg = 0;
+                p->gemm_a1_first = 0; /* sgemm(A2, A1) */
+                p->a2_notrans = nk; p->a2_trans_k = nk;
+            }
+        }
+    }
+}
 
 curfpStatus_t curfpSsfrk(
     curfpHandle_t    handle,
@@ -31,15 +150,11 @@ curfpStatus_t curfpSsfrk(
     if (!alpha || !beta)            return CURFP_STATUS_INVALID_VALUE;
     if (n == 0)                     return CURFP_STATUS_SUCCESS;
 
-    const float zero = 0.0f, one = 1.0f;
-
-    /* Quick return when result is trivially beta*C */
+    /* Quick returns */
     if ((*alpha == 0.0f || k == 0) && *beta == 1.0f)
         return CURFP_STATUS_SUCCESS;
 
-    /* If alpha==0 and beta==0 just zero the RFP array */
     if (*alpha == 0.0f && *beta == 0.0f) {
-        /* The RFP array has n*(n+1)/2 elements */
         long ntotal = (long)n * (n + 1) / 2;
         CURFP_CHECK_CUDA(cudaMemset(C, 0, ntotal * sizeof(float)));
         return CURFP_STATUS_SUCCESS;
@@ -47,234 +162,51 @@ curfpStatus_t curfpSsfrk(
 
     cublasHandle_t cb = handle->cublas;
 
-    const int notrans     = (trans  == CURFP_OP_N);
+    const int notrans      = (trans  == CURFP_OP_N);
     const int normaltransr = (transr == CURFP_OP_N);
-    const int lower       = (uplo   == CURFP_FILL_MODE_LOWER);
-    const int nisodd      = (n % 2 != 0);
+    const int lower        = (uplo   == CURFP_FILL_MODE_LOWER);
+    const int nisodd       = (n % 2 != 0);
+
+    const cublasOperation_t opN = CUBLAS_OP_N;
+    const cublasOperation_t opT = CUBLAS_OP_T;
+    const cublasOperation_t opA = notrans ? opN : opT;
+    const cublasOperation_t opAt = notrans ? opT : opN;
 
     /* Sub-block dimensions */
-    int n1, n2;
+    int n1 = 0, n2 = 0, nk = 0;
     if (nisodd) {
         if (lower) { n2 = n / 2; n1 = n - n2; }
         else       { n1 = n / 2; n2 = n - n1; }
     } else {
-        n1 = n / 2;
-        n2 = n1;      /* only NK is used for even N */
+        nk = n / 2; n1 = nk; n2 = nk;
     }
 
-    /* cuBLAS enums for the operation on A */
-    cublasOperation_t opN = CUBLAS_OP_N;
-    cublasOperation_t opT = CUBLAS_OP_T;
+    ssfrk_params_t p;
+    get_ssfrk_params(nisodd, normaltransr, lower, n, n1, n2, nk, &p);
 
-    /* Pointer to second block of A:
-     *   notrans: row offset  → A + n1 (rows 1..n1 of A in col-major = column shift)
-     *   trans:   col offset  → A + n1*lda
-     * For the odd/N/U case the second block starts at row n2 of A (A(N2,1) in
-     * Fortran), i.e. offset n2-1 or n2-1 * lda for the transpose case.
-     */
+    /* A block pointers */
+    const float *A1 = A;
+    const float *A2 = notrans ? A + p.a2_notrans
+                              : A + p.a2_trans_k * (long)lda;
 
-    /* =====================================================================
-     * 8 RFP cases
-     * ===================================================================== */
+    /* ssyrk on block 1 */
+    CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
+        p.fill1, opA,
+        p.dim1, k, alpha, A1, lda, beta, C + p.off1, p.ldc));
 
-    if (nisodd) {
-        /* ------------------------------------------------------------------ */
-        /* Odd N                                                               */
-        /* ------------------------------------------------------------------ */
-        if (normaltransr) {
-            /* ldc for sub-blocks = N */
-            if (lower) {
-                /* Case 1: odd, TRANSR=N, UPLO=L
-                 *   SSYRK('L', trans, n1, k, alpha, A1, lda, beta, C+0,  n)
-                 *   SSYRK('U', trans, n2, k, alpha, A2, lda, beta, C+n,  n)
-                 *   SGEMM                       ...         beta, C+n1, n)
-                 * Fortran: C(1)=C+0, C(N+1)=C+n, C(N1+1)=C+n1  (0-based)
-                 */
-                const float *A1 = A;
-                const float *A2 = notrans ? A + n1 : A + (long)n1 * lda;
+    /* ssyrk on block 2 */
+    CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
+        p.fill2, opA,
+        p.dim2, k, alpha, A2, lda, beta, C + p.off2, p.ldc));
 
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, notrans ? opN : opT,
-                    n1, k, alpha, A1, lda, beta, C + 0, n));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, notrans ? opN : opT,
-                    n2, k, alpha, A2, lda, beta, C + n, n));
-
-                CURFP_CHECK_CUBLAS(cublasSgemm(cb,
-                    notrans ? opN : opT, notrans ? opT : opN,
-                    n2, n1, k,
-                    alpha, A2, lda, A1, lda,
-                    beta, C + n1, n));
-
-            } else {
-                /* Case 2: odd, TRANSR=N, UPLO=U
-                 * Fortran: C(N2+1)=C+n2, C(N1+1)=C+n1, C(1)=C+0
-                 * A1=A(1,1), A2=A(N2,1) i.e. row n2 (0-based row n2-1)
-                 */
-                const float *A1 = A;
-                const float *A2 = notrans ? A + (n2 - 1)
-                                          : A + (long)(n2 - 1) * lda;
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, notrans ? opN : opT,
-                    n1, k, alpha, A1, lda, beta, C + n2, n));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, notrans ? opN : opT,
-                    n2, k, alpha, A2, lda, beta, C + n1, n));
-
-                CURFP_CHECK_CUBLAS(cublasSgemm(cb,
-                    notrans ? opN : opT, notrans ? opT : opN,
-                    n1, n2, k,
-                    alpha, A1, lda, A2, lda,
-                    beta, C + 0, n));
-            }
-        } else {
-            /* TRANSR=T */
-            if (lower) {
-                /* Case 3: odd, TRANSR=T, UPLO=L
-                 * ldc = n1
-                 * Fortran: C(1)=C+0, C(2)=C+1, C(N1*N1+1)=C+n1*n1
-                 */
-                const float *A1 = A;
-                const float *A2 = notrans ? A + n1 : A + (long)n1 * lda;
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, notrans ? opN : opT,
-                    n1, k, alpha, A1, lda, beta, C + 0, n1));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, notrans ? opN : opT,
-                    n2, k, alpha, A2, lda, beta, C + 1, n1));
-
-                CURFP_CHECK_CUBLAS(cublasSgemm(cb,
-                    notrans ? opN : opT, notrans ? opT : opN,
-                    n1, n2, k,
-                    alpha, A1, lda, A2, lda,
-                    beta, C + (long)n1 * n1, n1));
-
-            } else {
-                /* Case 4: odd, TRANSR=T, UPLO=U
-                 * ldc = n2
-                 * Fortran: C(N2*N2+1)=C+n2*n2, C(N1*N2+1)=C+n1*n2, C(1)=C+0
-                 */
-                const float *A1 = A;
-                const float *A2 = notrans ? A + n1 : A + (long)n1 * lda;
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, notrans ? opN : opT,
-                    n1, k, alpha, A1, lda, beta, C + (long)n2 * n2, n2));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, notrans ? opN : opT,
-                    n2, k, alpha, A2, lda, beta, C + (long)n1 * n2, n2));
-
-                CURFP_CHECK_CUBLAS(cublasSgemm(cb,
-                    notrans ? opN : opT, notrans ? opT : opN,
-                    n2, n1, k,
-                    alpha, A2, lda, A1, lda,
-                    beta, C + 0, n2));
-            }
-        }
-    } else {
-        /* ------------------------------------------------------------------ */
-        /* Even N: NK = N/2                                                    */
-        /* ------------------------------------------------------------------ */
-        const int nk = n1;  /* == n2 == n/2 */
-
-        if (normaltransr) {
-            /* ldc for sub-blocks = N+1 */
-            if (lower) {
-                /* Case 5: even, TRANSR=N, UPLO=L
-                 * Fortran: C(2)=C+1, C(1)=C+0, C(NK+2)=C+nk+1
-                 */
-                const float *A1 = A;
-                const float *A2 = notrans ? A + nk : A + (long)nk * lda;
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, notrans ? opN : opT,
-                    nk, k, alpha, A1, lda, beta, C + 1, n + 1));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, notrans ? opN : opT,
-                    nk, k, alpha, A2, lda, beta, C + 0, n + 1));
-
-                CURFP_CHECK_CUBLAS(cublasSgemm(cb,
-                    notrans ? opN : opT, notrans ? opT : opN,
-                    nk, nk, k,
-                    alpha, A2, lda, A1, lda,
-                    beta, C + nk + 1, n + 1));
-
-            } else {
-                /* Case 6: even, TRANSR=N, UPLO=U
-                 * Fortran: C(NK+2)=C+nk+1, C(NK+1)=C+nk, C(1)=C+0
-                 */
-                const float *A1 = A;
-                const float *A2 = notrans ? A + nk : A + (long)nk * lda;
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, notrans ? opN : opT,
-                    nk, k, alpha, A1, lda, beta, C + nk + 1, n + 1));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, notrans ? opN : opT,
-                    nk, k, alpha, A2, lda, beta, C + nk, n + 1));
-
-                CURFP_CHECK_CUBLAS(cublasSgemm(cb,
-                    notrans ? opN : opT, notrans ? opT : opN,
-                    nk, nk, k,
-                    alpha, A1, lda, A2, lda,
-                    beta, C + 0, n + 1));
-            }
-        } else {
-            /* TRANSR=T */
-            if (lower) {
-                /* Case 7: even, TRANSR=T, UPLO=L
-                 * ldc = nk
-                 * Fortran: C(NK+1)=C+nk, C(1)=C+0, C((NK+1)*NK+1)=C+(nk+1)*nk
-                 */
-                const float *A1 = A;
-                const float *A2 = notrans ? A + nk : A + (long)nk * lda;
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, notrans ? opN : opT,
-                    nk, k, alpha, A1, lda, beta, C + nk, nk));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, notrans ? opN : opT,
-                    nk, k, alpha, A2, lda, beta, C + 0, nk));
-
-                CURFP_CHECK_CUBLAS(cublasSgemm(cb,
-                    notrans ? opN : opT, notrans ? opT : opN,
-                    nk, nk, k,
-                    alpha, A1, lda, A2, lda,
-                    beta, C + (long)(nk + 1) * nk, nk));
-
-            } else {
-                /* Case 8: even, TRANSR=T, UPLO=U
-                 * ldc = nk
-                 * Fortran: C(NK*(NK+1)+1)=C+nk*(nk+1), C(NK*NK+1)=C+nk*nk, C(1)=C+0
-                 */
-                const float *A1 = A;
-                const float *A2 = notrans ? A + nk : A + (long)nk * lda;
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, notrans ? opN : opT,
-                    nk, k, alpha, A1, lda, beta, C + (long)nk * (nk + 1), nk));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, notrans ? opN : opT,
-                    nk, k, alpha, A2, lda, beta, C + (long)nk * nk, nk));
-
-                CURFP_CHECK_CUBLAS(cublasSgemm(cb,
-                    notrans ? opN : opT, notrans ? opT : opN,
-                    nk, nk, k,
-                    alpha, A2, lda, A1, lda,
-                    beta, C + 0, nk));
-            }
-        }
-    }
+    /* sgemm on off-diagonal block */
+    const float *Ag1 = p.gemm_a1_first ? A1 : A2;
+    const float *Ag2 = p.gemm_a1_first ? A2 : A1;
+    CURFP_CHECK_CUBLAS(cublasSgemm(cb,
+        opA, opAt,
+        p.gemm_m, p.gemm_n, k,
+        alpha, Ag1, lda, Ag2, lda,
+        beta,  C + p.offg, p.ldc));
 
     return CURFP_STATUS_SUCCESS;
 }

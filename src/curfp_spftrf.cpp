@@ -1,28 +1,23 @@
 /*
  * curfpSpftrf — Cholesky factorization in RFP format (single precision)
  *
- * Direct translation of LAPACK spftrf.f to CUDA using cuSOLVER for SPOTRF
- * and cuBLAS for STRSM and SSYRK.
+ * Direct translation of LAPACK spftrf.f to CUDA using cuSOLVER (SPOTRF)
+ * and cuBLAS (STRSM, SSYRK).
  *
- * The RFP array A (0-based, as in LAPACK spftrf which uses A(0:*)) is
- * partitioned into blocks; pointer offsets follow the LAPACK reference source
- * exactly and translate directly to C pointer arithmetic with no adjustment.
+ * There are 8 RFP storage variants: N parity × transr × uplo.
+ * Each variant performs: SPOTRF → STRSM → SSYRK → SPOTRF on sub-blocks.
  *
- * There are 8 RFP storage variants:
- *   N parity (odd/even) × transr (N/T) × uplo (L/U)
- * Each variant performs: SPOTRF → STRSM → SSYRK → SPOTRF
- *
- * cuSOLVER's spotrf requires a workspace buffer that we allocate and free per
- * call.  A device-side devInfo integer is used to retrieve the factorization
- * status.
+ * Instead of 8 copy-pasted blocks, sub-block layout is captured in a struct
+ * and one generic code path runs the 4 calls.
  */
 
 #include <stdlib.h>
 #include "curfp_internal.h"
 
-/* Helper: run cusolverDnSpotrf on a sub-block of the RFP array.
- * Allocates workspace internally, writes result back into A_blk in place.
- * On return, *info is set: 0 = success, >0 = not positive definite. */
+/* -------------------------------------------------------------------------
+ * Helper: run cusolverDnSpotrf on one sub-block.
+ * Allocates/frees workspace internally per call.
+ * ------------------------------------------------------------------------- */
 static curfpStatus_t run_spotrf(
     cusolverDnHandle_t solver,
     cublasFillMode_t   fill,
@@ -34,7 +29,6 @@ static curfpStatus_t run_spotrf(
     int lwork = 0;
     CURFP_CHECK_CUSOLVER(cusolverDnSpotrf_bufferSize(solver, fill, n,
                                                       A_blk, lda, &lwork));
-
     float *work = NULL;
     CURFP_CHECK_CUDA(cudaMalloc((void **)&work, (size_t)lwork * sizeof(float)));
 
@@ -44,17 +38,178 @@ static curfpStatus_t run_spotrf(
 
     cusolverStatus_t st = cusolverDnSpotrf(solver, fill, n,
                                             A_blk, lda, work, lwork, devInfo);
-
-    /* Copy devInfo back to host before freeing */
     int h_info = 0;
     cudaMemcpy(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost);
-
     cudaFree(work);
     cudaFree(devInfo);
 
     if (st != CUSOLVER_STATUS_SUCCESS) return from_cusolver_status(st);
     *info_out = h_info;
     return CURFP_STATUS_SUCCESS;
+}
+
+/* -------------------------------------------------------------------------
+ * Per-case parameters for the 4 cuBLAS/cuSOLVER calls.
+ *
+ * Block layout (all offsets in elements):
+ *   blk11: spotrf1 block  (upper-left factor)
+ *   blk21: strsm  block   (off-diagonal)
+ *   blk22: spotrf2 block  (lower-right factor)
+ *
+ * STRSM solves: op(blk11) * blk21 = rhs  or  blk21 * op(blk11) = rhs
+ * SSYRK updates: blk22 -= blk21 * blk21^T  (or transposed)
+ * ------------------------------------------------------------------------- */
+typedef struct {
+    /* spotrf block 1 */
+    cublasFillMode_t  fill11;
+    int               dim11;
+    long              off11;
+    int               lda11;
+
+    /* strsm */
+    cublasSideMode_t  trsm_side;
+    cublasFillMode_t  trsm_fill;
+    cublasOperation_t trsm_op;
+    long              trsm_a_off;  /* pointer to triangular factor (blk11) */
+    long              trsm_b_off;  /* pointer to rhs/solution (blk21) */
+    int               trsm_m, trsm_n;
+    int               trsm_lda, trsm_ldb;
+
+    /* ssyrk */
+    cublasFillMode_t  syrk_fill;
+    cublasOperation_t syrk_op;
+    int               syrk_n, syrk_k;
+    long              syrk_a_off;  /* blk21 pointer */
+    int               syrk_lda;
+    long              syrk_c_off;  /* blk22 pointer */
+    int               syrk_ldc;
+
+    /* spotrf block 2 */
+    cublasFillMode_t  fill22;
+    int               dim22;
+    long              off22;
+    int               lda22;
+    int               info22_offset;  /* added to sub_info for block-2 failures */
+} spftrf_params_t;
+
+static void get_spftrf_params(int nisodd, int normaltransr, int lower,
+                               int n, int n1, int n2, int nk,
+                               spftrf_params_t *p)
+{
+    if (nisodd) {
+        if (normaltransr) {
+            /* lda_rfp = n for both sub-blocks */
+            if (lower) {
+                /* Case 1: odd, TRANSR=N, UPLO=L
+                 *   L11 at A+0  (n1×n1, lower), L21 at A+n1, L22 at A+n (n2×n2, upper) */
+                p->fill11 = CUBLAS_FILL_MODE_LOWER; p->dim11 = n1; p->off11 = 0;    p->lda11 = n;
+                p->trsm_side = CUBLAS_SIDE_RIGHT; p->trsm_fill = CUBLAS_FILL_MODE_LOWER;
+                p->trsm_op = CUBLAS_OP_T; p->trsm_m = n2; p->trsm_n = n1;
+                p->trsm_a_off = 0; p->trsm_b_off = n1; p->trsm_lda = n; p->trsm_ldb = n;
+                p->syrk_fill = CUBLAS_FILL_MODE_UPPER; p->syrk_op = CUBLAS_OP_N;
+                p->syrk_n = n2; p->syrk_k = n1; p->syrk_a_off = n1; p->syrk_lda = n;
+                p->syrk_c_off = n; p->syrk_ldc = n;
+                p->fill22 = CUBLAS_FILL_MODE_UPPER; p->dim22 = n2; p->off22 = n;  p->lda22 = n;
+                p->info22_offset = n1;
+            } else {
+                /* Case 2: odd, TRANSR=N, UPLO=U
+                 *   U11 at A+n2 (n1×n1, lower), U21 at A+0, U22 at A+n1 (n2×n2, upper) */
+                p->fill11 = CUBLAS_FILL_MODE_LOWER; p->dim11 = n1; p->off11 = n2;  p->lda11 = n;
+                p->trsm_side = CUBLAS_SIDE_LEFT; p->trsm_fill = CUBLAS_FILL_MODE_LOWER;
+                p->trsm_op = CUBLAS_OP_N; p->trsm_m = n1; p->trsm_n = n2;
+                p->trsm_a_off = n2; p->trsm_b_off = 0; p->trsm_lda = n; p->trsm_ldb = n;
+                p->syrk_fill = CUBLAS_FILL_MODE_UPPER; p->syrk_op = CUBLAS_OP_T;
+                p->syrk_n = n2; p->syrk_k = n1; p->syrk_a_off = 0; p->syrk_lda = n;
+                p->syrk_c_off = n1; p->syrk_ldc = n;
+                p->fill22 = CUBLAS_FILL_MODE_UPPER; p->dim22 = n2; p->off22 = n1; p->lda22 = n;
+                p->info22_offset = n1;
+            }
+        } else {
+            /* TRANSR=T */
+            if (lower) {
+                /* Case 3: odd, TRANSR=T, UPLO=L, lda_rfp=n1
+                 *   L11 at A+0 (n1×n1, upper, lda=n1), L21 at A+n1*n1, L22 at A+1 (n2×n2, lower) */
+                p->fill11 = CUBLAS_FILL_MODE_UPPER; p->dim11 = n1; p->off11 = 0; p->lda11 = n1;
+                p->trsm_side = CUBLAS_SIDE_LEFT; p->trsm_fill = CUBLAS_FILL_MODE_UPPER;
+                p->trsm_op = CUBLAS_OP_T; p->trsm_m = n1; p->trsm_n = n2;
+                p->trsm_a_off = 0; p->trsm_b_off = (long)n1*n1; p->trsm_lda = n1; p->trsm_ldb = n1;
+                p->syrk_fill = CUBLAS_FILL_MODE_LOWER; p->syrk_op = CUBLAS_OP_T;
+                p->syrk_n = n2; p->syrk_k = n1; p->syrk_a_off = (long)n1*n1; p->syrk_lda = n1;
+                p->syrk_c_off = 1; p->syrk_ldc = n1;
+                p->fill22 = CUBLAS_FILL_MODE_LOWER; p->dim22 = n2; p->off22 = 1; p->lda22 = n1;
+                p->info22_offset = n1;
+            } else {
+                /* Case 4: odd, TRANSR=T, UPLO=U, lda_rfp=n2
+                 *   U11 at A+n2*n2 (n1×n1, upper, lda=n2), U21 at A+0, U22 at A+n1*n2 (n2×n2, lower) */
+                p->fill11 = CUBLAS_FILL_MODE_UPPER; p->dim11 = n1; p->off11 = (long)n2*n2; p->lda11 = n2;
+                p->trsm_side = CUBLAS_SIDE_RIGHT; p->trsm_fill = CUBLAS_FILL_MODE_UPPER;
+                p->trsm_op = CUBLAS_OP_N; p->trsm_m = n2; p->trsm_n = n1;
+                p->trsm_a_off = (long)n2*n2; p->trsm_b_off = 0; p->trsm_lda = n2; p->trsm_ldb = n2;
+                p->syrk_fill = CUBLAS_FILL_MODE_LOWER; p->syrk_op = CUBLAS_OP_N;
+                p->syrk_n = n2; p->syrk_k = n1; p->syrk_a_off = 0; p->syrk_lda = n2;
+                p->syrk_c_off = (long)n1*n2; p->syrk_ldc = n2;
+                p->fill22 = CUBLAS_FILL_MODE_LOWER; p->dim22 = n2; p->off22 = (long)n1*n2; p->lda22 = n2;
+                p->info22_offset = n1;
+            }
+        }
+    } else {
+        /* Even N: k = nk */
+        if (normaltransr) {
+            /* lda_rfp = n+1 */
+            if (lower) {
+                /* Case 5: even, TRANSR=N, UPLO=L
+                 *   L11 at A+1 (k×k, lower, lda=n+1), L21 at A+k+1, L22 at A+0 (k×k, upper) */
+                p->fill11 = CUBLAS_FILL_MODE_LOWER; p->dim11 = nk; p->off11 = 1;    p->lda11 = n+1;
+                p->trsm_side = CUBLAS_SIDE_RIGHT; p->trsm_fill = CUBLAS_FILL_MODE_LOWER;
+                p->trsm_op = CUBLAS_OP_T; p->trsm_m = nk; p->trsm_n = nk;
+                p->trsm_a_off = 1; p->trsm_b_off = nk+1; p->trsm_lda = n+1; p->trsm_ldb = n+1;
+                p->syrk_fill = CUBLAS_FILL_MODE_UPPER; p->syrk_op = CUBLAS_OP_N;
+                p->syrk_n = nk; p->syrk_k = nk; p->syrk_a_off = nk+1; p->syrk_lda = n+1;
+                p->syrk_c_off = 0; p->syrk_ldc = n+1;
+                p->fill22 = CUBLAS_FILL_MODE_UPPER; p->dim22 = nk; p->off22 = 0;    p->lda22 = n+1;
+                p->info22_offset = nk;
+            } else {
+                /* Case 6: even, TRANSR=N, UPLO=U
+                 *   U11 at A+k+1 (k×k, lower, lda=n+1), U21 at A+0, U22 at A+k (k×k, upper) */
+                p->fill11 = CUBLAS_FILL_MODE_LOWER; p->dim11 = nk; p->off11 = nk+1; p->lda11 = n+1;
+                p->trsm_side = CUBLAS_SIDE_LEFT; p->trsm_fill = CUBLAS_FILL_MODE_LOWER;
+                p->trsm_op = CUBLAS_OP_N; p->trsm_m = nk; p->trsm_n = nk;
+                p->trsm_a_off = nk+1; p->trsm_b_off = 0; p->trsm_lda = n+1; p->trsm_ldb = n+1;
+                p->syrk_fill = CUBLAS_FILL_MODE_UPPER; p->syrk_op = CUBLAS_OP_T;
+                p->syrk_n = nk; p->syrk_k = nk; p->syrk_a_off = 0; p->syrk_lda = n+1;
+                p->syrk_c_off = nk; p->syrk_ldc = n+1;
+                p->fill22 = CUBLAS_FILL_MODE_UPPER; p->dim22 = nk; p->off22 = nk;   p->lda22 = n+1;
+                p->info22_offset = nk;
+            }
+        } else {
+            /* TRANSR=T, lda_rfp=nk */
+            if (lower) {
+                /* Case 7: even, TRANSR=T, UPLO=L
+                 *   L11 at A+k (k×k, upper, lda=k), L21 at A+k*(k+1), L22 at A+0 (k×k, lower) */
+                p->fill11 = CUBLAS_FILL_MODE_UPPER; p->dim11 = nk; p->off11 = nk;           p->lda11 = nk;
+                p->trsm_side = CUBLAS_SIDE_LEFT; p->trsm_fill = CUBLAS_FILL_MODE_UPPER;
+                p->trsm_op = CUBLAS_OP_T; p->trsm_m = nk; p->trsm_n = nk;
+                p->trsm_a_off = nk; p->trsm_b_off = (long)nk*(nk+1); p->trsm_lda = nk; p->trsm_ldb = nk;
+                p->syrk_fill = CUBLAS_FILL_MODE_LOWER; p->syrk_op = CUBLAS_OP_T;
+                p->syrk_n = nk; p->syrk_k = nk; p->syrk_a_off = (long)nk*(nk+1); p->syrk_lda = nk;
+                p->syrk_c_off = 0; p->syrk_ldc = nk;
+                p->fill22 = CUBLAS_FILL_MODE_LOWER; p->dim22 = nk; p->off22 = 0;            p->lda22 = nk;
+                p->info22_offset = nk;
+            } else {
+                /* Case 8: even, TRANSR=T, UPLO=U
+                 *   U11 at A+k*(k+1) (k×k, upper, lda=k), U21 at A+0, U22 at A+k*k (k×k, lower) */
+                p->fill11 = CUBLAS_FILL_MODE_UPPER; p->dim11 = nk; p->off11 = (long)nk*(nk+1); p->lda11 = nk;
+                p->trsm_side = CUBLAS_SIDE_RIGHT; p->trsm_fill = CUBLAS_FILL_MODE_UPPER;
+                p->trsm_op = CUBLAS_OP_N; p->trsm_m = nk; p->trsm_n = nk;
+                p->trsm_a_off = (long)nk*(nk+1); p->trsm_b_off = 0; p->trsm_lda = nk; p->trsm_ldb = nk;
+                p->syrk_fill = CUBLAS_FILL_MODE_LOWER; p->syrk_op = CUBLAS_OP_N;
+                p->syrk_n = nk; p->syrk_k = nk; p->syrk_a_off = 0; p->syrk_lda = nk;
+                p->syrk_c_off = (long)nk*nk; p->syrk_ldc = nk;
+                p->fill22 = CUBLAS_FILL_MODE_LOWER; p->dim22 = nk; p->off22 = (long)nk*nk; p->lda22 = nk;
+                p->info22_offset = nk;
+            }
+        }
+    }
 }
 
 curfpStatus_t curfpSpftrf(
@@ -78,246 +233,45 @@ curfpStatus_t curfpSpftrf(
     const int lower        = (uplo   == CURFP_FILL_MODE_LOWER);
     const int nisodd       = (n % 2 != 0);
 
-    /* Sub-block dimensions.  Convention follows LAPACK spftrf.f:
-     *   odd N, lower:  n2=n/2, n1=n-n2  (n1=ceil(n/2))
-     *   odd N, upper:  n1=n/2, n2=n-n1  (n2=ceil(n/2))
-     *   even N:        k=n/2 (n1=n2=k)                     */
-    int n1, n2, nk;
+    int n1 = 0, n2 = 0, nk = 0;
     if (nisodd) {
         if (lower) { n2 = n / 2; n1 = n - n2; }
         else       { n1 = n / 2; n2 = n - n1; }
     } else {
-        nk = n / 2;
-        n1 = nk; n2 = nk;   /* unused individually for even N */
+        nk = n / 2; n1 = nk; n2 = nk;
     }
+
+    spftrf_params_t p;
+    get_spftrf_params(nisodd, normaltransr, lower, n, n1, n2, nk, &p);
 
     const float one  =  1.0f;
     const float mone = -1.0f;
-
     curfpStatus_t st;
     int sub_info = 0;
 
-    /* =====================================================================
-     * 8 RFP cases
-     * ===================================================================== */
+    /* 1. SPOTRF on block 11 */
+    st = run_spotrf(cs, p.fill11, p.dim11, A + p.off11, p.lda11, &sub_info);
+    if (st != CURFP_STATUS_SUCCESS) return st;
+    if (sub_info != 0) { *info = sub_info; return CURFP_STATUS_SUCCESS; }
 
-    if (nisodd) {
-        /* ------------------------------------------------------------------ */
-        /* Odd N                                                               */
-        /* ------------------------------------------------------------------ */
-        if (normaltransr) {
-            /* lda_rfp = N for both sub-blocks */
-            if (lower) {
-                /* Case 1: odd, TRANSR=N, UPLO=L
-                 * Block layout (0-based offsets):
-                 *   L11 at A+0  (n1 x n1, lower, lda=n)
-                 *   L21 at A+n1 (n2 x n1, lda=n)
-                 *   L22 at A+n  (n2 x n2, upper, lda=n)
-                 */
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_LOWER, n1, A + 0, n, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info; return CURFP_STATUS_SUCCESS; }
+    /* 2. STRSM: solve triangular system to update off-diagonal block */
+    CURFP_CHECK_CUBLAS(cublasStrsm(cb,
+        p.trsm_side, p.trsm_fill, p.trsm_op, CUBLAS_DIAG_NON_UNIT,
+        p.trsm_m, p.trsm_n, &one,
+        A + p.trsm_a_off, p.trsm_lda,
+        A + p.trsm_b_off, p.trsm_ldb));
 
-                CURFP_CHECK_CUBLAS(cublasStrsm(cb,
-                    CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_LOWER,
-                    CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT,
-                    n2, n1, &one, A + 0, n, A + n1, n));
+    /* 3. SSYRK: update block 22 using the solved off-diagonal */
+    CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
+        p.syrk_fill, p.syrk_op,
+        p.syrk_n, p.syrk_k, &mone,
+        A + p.syrk_a_off, p.syrk_lda,
+        &one, A + p.syrk_c_off, p.syrk_ldc));
 
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
-                    n2, n1, &mone, A + n1, n, &one, A + n, n));
-
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_UPPER, n2, A + n, n, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info + n1; return CURFP_STATUS_SUCCESS; }
-
-            } else {
-                /* Case 2: odd, TRANSR=N, UPLO=U
-                 * Block layout (0-based offsets):
-                 *   U11 at A+n2  (n1 x n1, lower, lda=n)
-                 *   U21 at A+0   (n1 x n2, lda=n)   — note: stored transposed
-                 *   U22 at A+n1  (n2 x n2, upper, lda=n)
-                 */
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_LOWER, n1, A + n2, n, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info; return CURFP_STATUS_SUCCESS; }
-
-                CURFP_CHECK_CUBLAS(cublasStrsm(cb,
-                    CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER,
-                    CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
-                    n1, n2, &one, A + n2, n, A + 0, n));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_T,
-                    n2, n1, &mone, A + 0, n, &one, A + n1, n));
-
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_UPPER, n2, A + n1, n, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info + n1; return CURFP_STATUS_SUCCESS; }
-            }
-        } else {
-            /* TRANSR=T */
-            if (lower) {
-                /* Case 3: odd, TRANSR=T, UPLO=L
-                 * lda_rfp = n1
-                 * Block layout (0-based offsets):
-                 *   L11 at A+0      (n1 x n1, upper, lda=n1)
-                 *   L21 at A+n1*n1  (n1 x n2, lda=n1)
-                 *   L22 at A+1      (n2 x n2, lower, lda=n1)
-                 */
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_UPPER, n1, A + 0, n1, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info; return CURFP_STATUS_SUCCESS; }
-
-                CURFP_CHECK_CUBLAS(cublasStrsm(cb,
-                    CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER,
-                    CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT,
-                    n1, n2, &one, A + 0, n1, A + (long)n1 * n1, n1));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T,
-                    n2, n1, &mone, A + (long)n1 * n1, n1, &one, A + 1, n1));
-
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_LOWER, n2, A + 1, n1, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info + n1; return CURFP_STATUS_SUCCESS; }
-
-            } else {
-                /* Case 4: odd, TRANSR=T, UPLO=U
-                 * lda_rfp = n2
-                 * Block layout (0-based offsets):
-                 *   U11 at A+n2*n2  (n1 x n1, upper, lda=n2)
-                 *   U21 at A+0      (n2 x n1, lda=n2)
-                 *   U22 at A+n1*n2  (n2 x n2, lower, lda=n2)
-                 */
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_UPPER, n1, A + (long)n2 * n2, n2, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info; return CURFP_STATUS_SUCCESS; }
-
-                CURFP_CHECK_CUBLAS(cublasStrsm(cb,
-                    CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER,
-                    CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
-                    n2, n1, &one, A + (long)n2 * n2, n2, A + 0, n2));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
-                    n2, n1, &mone, A + 0, n2, &one, A + (long)n1 * n2, n2));
-
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_LOWER, n2, A + (long)n1 * n2, n2, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info + n1; return CURFP_STATUS_SUCCESS; }
-            }
-        }
-    } else {
-        /* ------------------------------------------------------------------ */
-        /* Even N: k = N/2                                                    */
-        /* ------------------------------------------------------------------ */
-        const int k = nk;
-
-        if (normaltransr) {
-            /* lda_rfp = N+1 */
-            if (lower) {
-                /* Case 5: even, TRANSR=N, UPLO=L
-                 * Block layout (0-based offsets):
-                 *   L11 at A+1    (k x k, lower, lda=n+1)
-                 *   L21 at A+k+1  (k x k, lda=n+1)
-                 *   L22 at A+0    (k x k, upper, lda=n+1)
-                 */
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_LOWER, k, A + 1, n + 1, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info; return CURFP_STATUS_SUCCESS; }
-
-                CURFP_CHECK_CUBLAS(cublasStrsm(cb,
-                    CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_LOWER,
-                    CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT,
-                    k, k, &one, A + 1, n + 1, A + k + 1, n + 1));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_N,
-                    k, k, &mone, A + k + 1, n + 1, &one, A + 0, n + 1));
-
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_UPPER, k, A + 0, n + 1, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info + k; return CURFP_STATUS_SUCCESS; }
-
-            } else {
-                /* Case 6: even, TRANSR=N, UPLO=U
-                 * Block layout (0-based offsets):
-                 *   U11 at A+k+1  (k x k, lower, lda=n+1)
-                 *   U21 at A+0    (k x k, lda=n+1)
-                 *   U22 at A+k    (k x k, upper, lda=n+1)
-                 */
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_LOWER, k, A + k + 1, n + 1, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info; return CURFP_STATUS_SUCCESS; }
-
-                CURFP_CHECK_CUBLAS(cublasStrsm(cb,
-                    CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_LOWER,
-                    CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
-                    k, k, &one, A + k + 1, n + 1, A + 0, n + 1));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_UPPER, CUBLAS_OP_T,
-                    k, k, &mone, A + 0, n + 1, &one, A + k, n + 1));
-
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_UPPER, k, A + k, n + 1, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info + k; return CURFP_STATUS_SUCCESS; }
-            }
-        } else {
-            /* TRANSR=T */
-            if (lower) {
-                /* Case 7: even, TRANSR=T, UPLO=L
-                 * lda_rfp = k
-                 * Block layout (0-based offsets):
-                 *   L11 at A+k       (k x k, upper, lda=k)
-                 *   L21 at A+k*(k+1) (k x k, lda=k)
-                 *   L22 at A+0       (k x k, lower, lda=k)
-                 */
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_UPPER, k, A + k, k, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info; return CURFP_STATUS_SUCCESS; }
-
-                CURFP_CHECK_CUBLAS(cublasStrsm(cb,
-                    CUBLAS_SIDE_LEFT, CUBLAS_FILL_MODE_UPPER,
-                    CUBLAS_OP_T, CUBLAS_DIAG_NON_UNIT,
-                    k, k, &one, A + k, k, A + (long)k * (k + 1), k));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_T,
-                    k, k, &mone, A + (long)k * (k + 1), k, &one, A + 0, k));
-
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_LOWER, k, A + 0, k, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info + k; return CURFP_STATUS_SUCCESS; }
-
-            } else {
-                /* Case 8: even, TRANSR=T, UPLO=U
-                 * lda_rfp = k
-                 * Block layout (0-based offsets):
-                 *   U11 at A+k*(k+1) (k x k, upper, lda=k)
-                 *   U21 at A+0       (k x k, lda=k)
-                 *   U22 at A+k*k     (k x k, lower, lda=k)
-                 */
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_UPPER, k, A + (long)k * (k + 1), k, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info; return CURFP_STATUS_SUCCESS; }
-
-                CURFP_CHECK_CUBLAS(cublasStrsm(cb,
-                    CUBLAS_SIDE_RIGHT, CUBLAS_FILL_MODE_UPPER,
-                    CUBLAS_OP_N, CUBLAS_DIAG_NON_UNIT,
-                    k, k, &one, A + (long)k * (k + 1), k, A + 0, k));
-
-                CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
-                    CUBLAS_FILL_MODE_LOWER, CUBLAS_OP_N,
-                    k, k, &mone, A + 0, k, &one, A + (long)k * k, k));
-
-                st = run_spotrf(cs, CUBLAS_FILL_MODE_LOWER, k, A + (long)k * k, k, &sub_info);
-                if (st != CURFP_STATUS_SUCCESS) return st;
-                if (sub_info != 0) { *info = sub_info + k; return CURFP_STATUS_SUCCESS; }
-            }
-        }
-    }
+    /* 4. SPOTRF on block 22 */
+    st = run_spotrf(cs, p.fill22, p.dim22, A + p.off22, p.lda22, &sub_info);
+    if (st != CURFP_STATUS_SUCCESS) return st;
+    if (sub_info != 0) { *info = sub_info + p.info22_offset; return CURFP_STATUS_SUCCESS; }
 
     return CURFP_STATUS_SUCCESS;
 }

@@ -15,6 +15,7 @@ add_library(curfp SHARED
     src/curfp_handle.cpp
     src/curfp_ssfrk.cpp
     src/curfp_spftrf.cpp
+    src/curfp_spftrs.cpp
 )
 
 target_include_directories(curfp

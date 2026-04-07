@@ -94,6 +94,31 @@ int spftrf(Handle  &handle,
 }
 
 /* =========================================================================
+ * spftrs: triangular solve using RFP Cholesky factor
+ *
+ * A_ptr: raw device pointer to RFP Cholesky factor (from spftrf)
+ * B_ptr: raw device pointer to (n × nrhs) RHS, overwritten with solution
+ * =========================================================================*/
+void spftrs(Handle  &handle,
+            int      transr,
+            int      uplo,
+            int      n,
+            int      nrhs,
+            int64_t  A_ptr,
+            int64_t  B_ptr,
+            int      ldb)
+{
+    check_status(curfpSpftrs(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n, nrhs,
+        reinterpret_cast<const float *>(A_ptr),
+        reinterpret_cast<float *>(B_ptr),
+        ldb));
+}
+
+/* =========================================================================
  * Module
  * =========================================================================*/
 PYBIND11_MODULE(_curfp_C, m)
@@ -119,6 +144,12 @@ PYBIND11_MODULE(_curfp_C, m)
           py::arg("handle"),
           py::arg("transr"), py::arg("uplo"),
           py::arg("n"),      py::arg("A_ptr"));
+
+    m.def("spftrs", &spftrs,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),      py::arg("nrhs"),
+          py::arg("A_ptr"),  py::arg("B_ptr"), py::arg("ldb"));
 
     m.attr("OP_N")       = static_cast<int>(CURFP_OP_N);
     m.attr("OP_T")       = static_cast<int>(CURFP_OP_T);
