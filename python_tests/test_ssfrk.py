@@ -24,7 +24,7 @@ def test_passthrough_beta1():
                     C_orig = C.clone()
                     A_dummy = torch.zeros(1, dtype=torch.float32, device="cuda")
 
-                    curfp.ssfrk(h, transr, uplo, curfp.OP_N,
+                    curfp.ssfrk_raw(h, transr, uplo, curfp.OP_N,
                                 n, 1, 0.0, A_dummy, n, 1.0, C)
 
                     assert torch.allclose(C, C_orig), (
@@ -47,7 +47,7 @@ def test_zero_beta0():
                     C = torch.full((nt,), 99.0, dtype=torch.float32, device="cuda")
                     A_dummy = torch.zeros(1, dtype=torch.float32, device="cuda")
 
-                    curfp.ssfrk(h, transr, uplo, curfp.OP_N,
+                    curfp.ssfrk_raw(h, transr, uplo, curfp.OP_N,
                                 n, 1, 0.0, A_dummy, n, 0.0, C)
 
                     assert C.abs().max().item() < 1e-5, (
@@ -71,7 +71,7 @@ def test_n1_rank1():
                 C = torch.tensor([c], dtype=torch.float32, device="cuda")
                 A = torch.tensor([a], dtype=torch.float32, device="cuda")
 
-                curfp.ssfrk(h, transr, uplo, curfp.OP_N,
+                curfp.ssfrk_raw(h, transr, uplo, curfp.OP_N,
                             1, 1, alpha, A, 1, beta, C)
 
                 result = C.cpu().item()
@@ -96,7 +96,7 @@ def test_n2_NL_rank1():
     A = torch.tensor([a0, a1],        dtype=torch.float32, device="cuda")  # lda=2
 
     with curfp.Handle() as h:
-        curfp.ssfrk(h, curfp.OP_N, curfp.FILL_LOWER, curfp.OP_N,
+        curfp.ssfrk_raw(h, curfp.OP_N, curfp.FILL_LOWER, curfp.OP_N,
                     2, 1, alpha, A, 2, beta, C)
 
     ref00 = alpha * a0 * a0 + beta * c00
@@ -123,7 +123,7 @@ def test_stream():
     with curfp.Handle() as h:
         h.set_stream(stream)
         with torch.cuda.stream(stream):
-            curfp.ssfrk(h, curfp.OP_N, curfp.FILL_LOWER, curfp.OP_N,
+            curfp.ssfrk_raw(h, curfp.OP_N, curfp.FILL_LOWER, curfp.OP_N,
                         1, 1, alpha, A, 1, beta, C)
         torch.cuda.current_stream().wait_stream(stream)
 
