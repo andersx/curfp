@@ -14,39 +14,6 @@
 #include <stdlib.h>
 #include "curfp_internal.h"
 
-/* -------------------------------------------------------------------------
- * Helper: run cusolverDnSpotrf on one sub-block.
- * Allocates/frees workspace internally per call.
- * ------------------------------------------------------------------------- */
-static curfpStatus_t run_spotrf(
-    cusolverDnHandle_t solver,
-    cublasFillMode_t   fill,
-    int                n,
-    float             *A_blk,
-    int                lda,
-    int               *info_out)
-{
-    int lwork = 0;
-    CURFP_CHECK_CUSOLVER(cusolverDnSpotrf_bufferSize(solver, fill, n,
-                                                      A_blk, lda, &lwork));
-    float *work = NULL;
-    CURFP_CHECK_CUDA(cudaMalloc((void **)&work, (size_t)lwork * sizeof(float)));
-
-    int *devInfo = NULL;
-    CURFP_CHECK_CUDA(cudaMalloc((void **)&devInfo, sizeof(int)));
-    CURFP_CHECK_CUDA(cudaMemset(devInfo, 0, sizeof(int)));
-
-    cusolverStatus_t st = cusolverDnSpotrf(solver, fill, n,
-                                            A_blk, lda, work, lwork, devInfo);
-    int h_info = 0;
-    cudaMemcpy(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaFree(work);
-    cudaFree(devInfo);
-
-    if (st != CUSOLVER_STATUS_SUCCESS) return from_cusolver_status(st);
-    *info_out = h_info;
-    return CURFP_STATUS_SUCCESS;
-}
 
 /* -------------------------------------------------------------------------
  * Per-case parameters for the 4 cuBLAS/cuSOLVER calls.
@@ -246,32 +213,75 @@ curfpStatus_t curfpSpftrf(
 
     const float one  =  1.0f;
     const float mone = -1.0f;
-    curfpStatus_t st;
-    int sub_info = 0;
+
+    /* --- Pre-allocate shared workspace for both SPOTRF calls ------------- */
+    int lwork11 = 0, lwork22 = 0;
+    CURFP_CHECK_CUSOLVER(cusolverDnSpotrf_bufferSize(cs, p.fill11, p.dim11,
+                                                      A + p.off11, p.lda11, &lwork11));
+    CURFP_CHECK_CUSOLVER(cusolverDnSpotrf_bufferSize(cs, p.fill22, p.dim22,
+                                                      A + p.off22, p.lda22, &lwork22));
+    int lwork = (lwork11 > lwork22) ? lwork11 : lwork22;
+    if (lwork < 1) lwork = 1;   /* cudaMalloc(0) is implementation-defined */
+
+    float *work    = NULL;
+    int   *devInfo = NULL;
+    CURFP_CHECK_CUDA(cudaMalloc((void **)&work,    (size_t)lwork * sizeof(float)));
+    CURFP_CHECK_CUDA(cudaMalloc((void **)&devInfo, sizeof(int)));
+
+    curfpStatus_t st    = CURFP_STATUS_SUCCESS;
+    int           h_info = 0;
+
+/* Local error macros that jump to cleanup */
+#define CHK_CS(expr) \
+    do { cusolverStatus_t _s = (expr); \
+         if (_s != CUSOLVER_STATUS_SUCCESS) { \
+             st = from_cusolver_status(_s); goto cleanup; } \
+    } while (0)
+#define CHK_CB(expr) \
+    do { cublasStatus_t _s = (expr); \
+         if (_s != CUBLAS_STATUS_SUCCESS) { \
+             st = from_cublas_status(_s); goto cleanup; } \
+    } while (0)
+#define CHK_CU(expr) \
+    do { cudaError_t _e = (expr); \
+         if (_e != cudaSuccess) { \
+             st = CURFP_STATUS_EXECUTION_FAILED; goto cleanup; } \
+    } while (0)
 
     /* 1. SPOTRF on block 11 */
-    st = run_spotrf(cs, p.fill11, p.dim11, A + p.off11, p.lda11, &sub_info);
-    if (st != CURFP_STATUS_SUCCESS) return st;
-    if (sub_info != 0) { *info = sub_info; return CURFP_STATUS_SUCCESS; }
+    CHK_CU(cudaMemset(devInfo, 0, sizeof(int)));
+    CHK_CS(cusolverDnSpotrf(cs, p.fill11, p.dim11,
+                             A + p.off11, p.lda11, work, lwork, devInfo));
+    CHK_CU(cudaMemcpy(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
+    if (h_info != 0) { *info = h_info; goto cleanup; }
 
     /* 2. STRSM: solve triangular system to update off-diagonal block */
-    CURFP_CHECK_CUBLAS(cublasStrsm(cb,
+    CHK_CB(cublasStrsm(cb,
         p.trsm_side, p.trsm_fill, p.trsm_op, CUBLAS_DIAG_NON_UNIT,
         p.trsm_m, p.trsm_n, &one,
         A + p.trsm_a_off, p.trsm_lda,
         A + p.trsm_b_off, p.trsm_ldb));
 
     /* 3. SSYRK: update block 22 using the solved off-diagonal */
-    CURFP_CHECK_CUBLAS(cublasSsyrk(cb,
+    CHK_CB(cublasSsyrk(cb,
         p.syrk_fill, p.syrk_op,
         p.syrk_n, p.syrk_k, &mone,
         A + p.syrk_a_off, p.syrk_lda,
         &one, A + p.syrk_c_off, p.syrk_ldc));
 
-    /* 4. SPOTRF on block 22 */
-    st = run_spotrf(cs, p.fill22, p.dim22, A + p.off22, p.lda22, &sub_info);
-    if (st != CURFP_STATUS_SUCCESS) return st;
-    if (sub_info != 0) { *info = sub_info + p.info22_offset; return CURFP_STATUS_SUCCESS; }
+    /* 4. SPOTRF on block 22 (reuse work + devInfo) */
+    CHK_CU(cudaMemset(devInfo, 0, sizeof(int)));
+    CHK_CS(cusolverDnSpotrf(cs, p.fill22, p.dim22,
+                             A + p.off22, p.lda22, work, lwork, devInfo));
+    CHK_CU(cudaMemcpy(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
+    if (h_info != 0) { *info = h_info + p.info22_offset; goto cleanup; }
 
-    return CURFP_STATUS_SUCCESS;
+#undef CHK_CS
+#undef CHK_CB
+#undef CHK_CU
+
+cleanup:
+    cudaFree(work);
+    cudaFree(devInfo);
+    return st;
 }

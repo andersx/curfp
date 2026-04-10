@@ -119,6 +119,157 @@ void spftrs(Handle  &handle,
 }
 
 /* =========================================================================
+ * ssfmv: symmetric matrix-vector multiply in RFP format
+ *
+ * y := alpha * A * x + beta * y
+ * arf_ptr, x_ptr, y_ptr: raw device pointers (int64)
+ * =========================================================================*/
+void ssfmv(Handle        &handle,
+           int             transr,
+           int             uplo,
+           int             n,
+           float           alpha,
+           int64_t         arf_ptr,
+           int64_t         x_ptr,
+           int             incx,
+           float           beta,
+           int64_t         y_ptr,
+           int             incy)
+{
+    check_status(curfpSsfmv(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        &alpha,
+        reinterpret_cast<const float *>(arf_ptr),
+        reinterpret_cast<const float *>(x_ptr),
+        incx,
+        &beta,
+        reinterpret_cast<float *>(y_ptr),
+        incy));
+}
+
+/* =========================================================================
+ * spftri: compute inverse of SPD matrix from RFP Cholesky factor
+ *
+ * arf_ptr: raw device pointer to RFP Cholesky factor (from spftrf), overwritten
+ * =========================================================================*/
+void spftri(Handle  &handle,
+            int      transr,
+            int      uplo,
+            int      n,
+            int64_t  arf_ptr)
+{
+    check_status(curfpSpftri(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<float *>(arf_ptr)));
+}
+
+/* =========================================================================
+ * strttf: full triangular matrix → RFP format
+ *
+ * A_ptr: raw device pointer to n×n row-major matrix (int64)
+ * arf_ptr: raw device pointer to output RFP array of size n*(n+1)/2 (int64)
+ * =========================================================================*/
+void strttf(Handle  &handle,
+            int      transr,
+            int      uplo,
+            int      n,
+            int64_t  A_ptr,
+            int      lda,
+            int64_t  arf_ptr)
+{
+    check_status(curfpSstrttf(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<const float *>(A_ptr),
+        lda,
+        reinterpret_cast<float *>(arf_ptr)));
+}
+
+/* =========================================================================
+ * stfttr: RFP format → full triangular matrix
+ *
+ * arf_ptr: raw device pointer to RFP array of size n*(n+1)/2 (int64)
+ * A_ptr: raw device pointer to n×n row-major output matrix (int64)
+ * =========================================================================*/
+void stfttr(Handle  &handle,
+            int      transr,
+            int      uplo,
+            int      n,
+            int64_t  arf_ptr,
+            int64_t  A_ptr,
+            int      lda)
+{
+    check_status(curfpSstfttr(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<const float *>(arf_ptr),
+        reinterpret_cast<float *>(A_ptr),
+        lda));
+}
+
+/* =========================================================================
+ * slansf: norm of a symmetric matrix in RFP format
+ *
+ * norm: 0=NORM_MAX, 1=NORM_ONE, 2=NORM_FRO
+ * arf_ptr: raw device pointer (int64) from tensor.data_ptr()
+ * Returns: norm value as a Python float
+ * =========================================================================*/
+float slansf(Handle  &handle,
+             int      norm,
+             int      transr,
+             int      uplo,
+             int      n,
+             int64_t  arf_ptr)
+{
+    float result = 0.0f;
+    check_status(curfpSlansf(
+        handle.get(),
+        static_cast<curfpNormType_t>(norm),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<const float *>(arf_ptr),
+        &result));
+    return result;
+}
+
+/* =========================================================================
+ * spfcon: reciprocal condition number estimate from RFP Cholesky factor
+ *
+ * arf_ptr: raw device pointer to RFP Cholesky factor (int64)
+ * anorm:   1-norm of original matrix (before factorization)
+ * Returns: rcond estimate as a Python float
+ * =========================================================================*/
+float spfcon(Handle  &handle,
+             int      transr,
+             int      uplo,
+             int      n,
+             int64_t  arf_ptr,
+             float    anorm)
+{
+    float rcond = 0.0f;
+    check_status(curfpSpfcon(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<const float *>(arf_ptr),
+        anorm,
+        &rcond));
+    return rcond;
+}
+
+/* =========================================================================
  * Module
  * =========================================================================*/
 PYBIND11_MODULE(_curfp_C, m)
@@ -145,14 +296,58 @@ PYBIND11_MODULE(_curfp_C, m)
           py::arg("transr"), py::arg("uplo"),
           py::arg("n"),      py::arg("A_ptr"));
 
+    m.def("ssfmv", &ssfmv,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("alpha"),  py::arg("arf_ptr"),
+          py::arg("x_ptr"),  py::arg("incx"),
+          py::arg("beta"),   py::arg("y_ptr"), py::arg("incy"));
+
+    m.def("spftri", &spftri,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),      py::arg("arf_ptr"));
+
     m.def("spftrs", &spftrs,
           py::arg("handle"),
           py::arg("transr"), py::arg("uplo"),
           py::arg("n"),      py::arg("nrhs"),
           py::arg("A_ptr"),  py::arg("B_ptr"), py::arg("ldb"));
 
+    m.def("strttf", &strttf,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("A_ptr"),  py::arg("lda"),
+          py::arg("arf_ptr"));
+
+    m.def("stfttr", &stfttr,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("arf_ptr"),
+          py::arg("A_ptr"),  py::arg("lda"));
+
+    m.def("slansf", &slansf,
+          py::arg("handle"),
+          py::arg("norm"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("arf_ptr"));
+
+    m.def("spfcon", &spfcon,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("arf_ptr"),
+          py::arg("anorm"));
+
     m.attr("OP_N")       = static_cast<int>(CURFP_OP_N);
     m.attr("OP_T")       = static_cast<int>(CURFP_OP_T);
     m.attr("FILL_LOWER") = static_cast<int>(CURFP_FILL_MODE_LOWER);
     m.attr("FILL_UPPER") = static_cast<int>(CURFP_FILL_MODE_UPPER);
+    m.attr("NORM_MAX")   = static_cast<int>(CURFP_NORM_MAX);
+    m.attr("NORM_ONE")   = static_cast<int>(CURFP_NORM_ONE);
+    m.attr("NORM_FRO")   = static_cast<int>(CURFP_NORM_FRO);
 }
