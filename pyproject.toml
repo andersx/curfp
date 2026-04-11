@@ -11,11 +11,12 @@ dependencies = [
     "torch",
     "pytest",
     "scipy>=1.10.1",
+    "matplotlib",
 ]
 
 [tool.scikit-build]
 cmake.build-type = "Release"
-cmake.args = ["-DCURFP_BUILD_PYTHON=ON"]
+cmake.args = ["-DCURFP_BUILD_PYTHON=ON", "-DCMAKE_CUDA_ARCHITECTURES=60"]
 
 [tool.setuptools.package-data]
 curfp = ["*.so"]
