@@ -7,7 +7,11 @@ name = "curfp"
 version = "0.1.0"
 description = "CUDA RFP format matrix operations (ssfrk, spftrf) for PyTorch"
 requires-python = ">=3.8"
-dependencies = ["torch", "pytest"]
+dependencies = [
+    "torch",
+    "pytest",
+    "scipy>=1.10.1",
+]
 
 [tool.scikit-build]
 cmake.build-type = "Release"

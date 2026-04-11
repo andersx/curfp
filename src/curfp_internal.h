@@ -27,6 +27,11 @@ static inline cublasOperation_t to_cublas_op(curfpOperation_t op)
     return (op == CURFP_OP_N) ? CUBLAS_OP_N : CUBLAS_OP_T;
 }
 
+static inline cublasSideMode_t to_cublas_side(curfpSideMode_t side)
+{
+    return (side == CURFP_SIDE_LEFT) ? CUBLAS_SIDE_LEFT : CUBLAS_SIDE_RIGHT;
+}
+
 /* ---------------------------------------------------------------------------
  * Map cuBLAS status to curfp status
  * ---------------------------------------------------------------------------*/

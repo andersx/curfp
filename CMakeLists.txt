@@ -14,8 +14,18 @@ find_package(CUDAToolkit REQUIRED)
 add_library(curfp SHARED
     src/curfp_handle.cpp
     src/curfp_ssfrk.cpp
+    src/curfp_ssfr.cpp
+    src/curfp_ssfr2.cpp
+    src/curfp_ssfr2k.cpp
+    src/curfp_ssfmm.cpp
     src/curfp_spftrf.cpp
     src/curfp_spftrs.cpp
+    src/curfp_spftri.cu
+    src/curfp_ssfmv.cpp
+    src/curfp_spfcon.cu
+    src/curfp_slansf.cu
+    src/curfp_strttf.cu
+    src/curfp_stfttr.cu
 )
 
 target_include_directories(curfp
