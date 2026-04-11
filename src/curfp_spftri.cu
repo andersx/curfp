@@ -195,6 +195,10 @@ curfpStatus_t curfpSpftri(curfpHandle_t    handle,
     int m     = p.trsm_m;   /* rows of off-diagonal S block */
     int n_blk = p.trsm_n;   /* cols of off-diagonal S block */
 
+    cudaStream_t stream;
+    if (cublasGetStream(cb, &stream) != CUBLAS_STATUS_SUCCESS)
+        return CURFP_STATUS_EXECUTION_FAILED;
+
     /* --- Query workspace for both SPOTRI calls ----------------------------- */
     int lwork11 = 0, lwork22 = 0, lwork;
     {
@@ -220,6 +224,14 @@ curfpStatus_t curfpSpftri(curfpHandle_t    handle,
     const float mone = -1.0f;
     const float zero =  0.0f;
 
+    /* Precompute STRSM parameters here (before any goto) to avoid C++
+     * "transfer of control bypasses initialization" errors. */
+    const cublasOperation_t op_opp = (p.trsm_op == CUBLAS_OP_T) ? CUBLAS_OP_N : CUBLAS_OP_T;
+    const int fill22_upper = (p.fill22 == CUBLAS_FILL_MODE_UPPER);
+    const int side_left    = (p.trsm_side == CUBLAS_SIDE_LEFT);
+    const cublasOperation_t op_h   = (fill22_upper ^ side_left) ? CUBLAS_OP_T : CUBLAS_OP_N;
+    const cublasSideMode_t  h_side = side_left ? CUBLAS_SIDE_RIGHT : CUBLAS_SIDE_LEFT;
+
 /* Local error macros that jump to cleanup */
 #define CHK_CS(expr) \
     do { cusolverStatus_t _s = (expr); \
@@ -237,22 +249,18 @@ curfpStatus_t curfpSpftri(curfpHandle_t    handle,
              status = CURFP_STATUS_EXECUTION_FAILED; goto cleanup; } \
     } while (0)
 
-    CHK_CU(cudaMalloc((void **)&work,    (size_t)lwork     * sizeof(float)));
-    CHK_CU(cudaMalloc((void **)&g_buf,   (size_t)m * n_blk * sizeof(float)));
-    CHK_CU(cudaMalloc((void **)&h_buf,   (size_t)m * n_blk * sizeof(float)));
-    CHK_CU(cudaMalloc((void **)&devInfo, sizeof(int)));
+    CHK_CU(cudaMallocAsync((void **)&work,    (size_t)lwork     * sizeof(float), stream));
+    CHK_CU(cudaMallocAsync((void **)&g_buf,   (size_t)m * n_blk * sizeof(float), stream));
+    CHK_CU(cudaMallocAsync((void **)&h_buf,   (size_t)m * n_blk * sizeof(float), stream));
+    CHK_CU(cudaMallocAsync((void **)&devInfo, sizeof(int),                        stream));
 
     /* ---- Step 1: Copy S_block → g_buf
      *
      * g_buf starts as a copy of the off-diagonal S_block element, which will be
      * transformed into G by the STRSM in Step 2.  We copy first because
-     * S_block lives inside the arf array and will be overwritten in Step 5.
+     * S_block lives inside the arf array and will be overwritten in Step 7.
      * -------------------------------------------------------------------- */
     {
-        cudaStream_t stream;
-        if (cublasGetStream(cb, &stream) != CUBLAS_STATUS_SUCCESS) {
-            status = CURFP_STATUS_EXECUTION_FAILED; goto cleanup;
-        }
         dim3 blk(16, 16);
         dim3 grd((n_blk + 15)/16, (m + 15)/16);
         k_copy_mat<<<grd, blk, 0, stream>>>(
@@ -273,71 +281,48 @@ curfpStatus_t curfpSpftri(curfpHandle_t    handle,
      *   side=LEFT,  trsm_op=T → apply op=N: g_buf ← U11^{-1} * g_buf
      *   side=LEFT,  trsm_op=N → apply op=T: g_buf ← L11^{-T} * g_buf
      * -------------------------------------------------------------------- */
-    {
-        cublasOperation_t op_opp = (p.trsm_op == CUBLAS_OP_T) ? CUBLAS_OP_N : CUBLAS_OP_T;
-        CHK_CB(cublasStrsm(cb,
-            p.trsm_side, p.trsm_fill, op_opp, CUBLAS_DIAG_NON_UNIT,
-            m, n_blk, &one,
-            arf + p.trsm_a_off, p.trsm_lda,
-            g_buf, m));
-    }
+    CHK_CB(cublasStrsm(cb,
+        p.trsm_side, p.trsm_fill, op_opp, CUBLAS_DIAG_NON_UNIT,
+        m, n_blk, &one,
+        arf + p.trsm_a_off, p.trsm_lda,
+        g_buf, m));
 
     /* ---- Step 3: Compute H in h_buf via one STRSM on block22
      *
-     * H is chosen so that G^T*P22*G = H^T*H (side=RIGHT) or G*P22*G^T = H*H^T
-     * (side=LEFT), where P22 = (L22*L22^T)^{-1}.  This factorization means:
-     *
-     *   side=RIGHT: P22 = L22^{-T}*L22^{-1}
-     *               G^T*P22*G = (L22^{-1}*G)^T*(L22^{-1}*G) = H^T*H
-     *     fill22=UPPER (U): H = U^{-T}*G → STRSM(L,U,T, block22, copy_G→h_buf)
-     *     fill22=LOWER (L): H = L^{-1}*G → STRSM(L,L,N, block22, copy_G→h_buf)
-     *
-     *   side=LEFT: P22 = L22^{-T}*L22^{-1}
-     *              G*P22*G^T = (G*L22^{-1})*(G*L22^{-1})^T = H*H^T
-     *     fill22=UPPER (U): H = G*U^{-1} → STRSM(R,U,N, block22, copy_G→h_buf)
-     *     fill22=LOWER (L): H = G*L^{-T} → STRSM(R,L,T, block22, copy_G→h_buf)
+     * H is chosen so that G^T*P22*G = H^T*H (side=RIGHT) or G*P22*G^T = H*H^T.
+     * We copy g_buf → h_buf first (STRSM overwrites in-place).
+     * Must be done BEFORE SPOTRI(block22) destroys L22.
      *
      * Unified:
      *   h_side = opp(trsm_side)
      *   op_h   = ((fill22==UPPER) XOR (side==LEFT)) ? TRANS : NOTRANS
-     *
-     * We copy g_buf → h_buf first (STRSM overwrites in-place).
-     * This must be done BEFORE SPOTRI(block22) destroys L22.
      * -------------------------------------------------------------------- */
     {
-        cudaStream_t stream;
-        if (cublasGetStream(cb, &stream) != CUBLAS_STATUS_SUCCESS) {
-            status = CURFP_STATUS_EXECUTION_FAILED; goto cleanup;
-        }
         dim3 blk(16, 16);
         dim3 grd((n_blk + 15)/16, (m + 15)/16);
         k_copy_mat<<<grd, blk, 0, stream>>>(g_buf, m, h_buf, m, m, n_blk);
         CHK_CU(cudaGetLastError());
-
-        int fill22_upper = (p.fill22 == CUBLAS_FILL_MODE_UPPER);
-        int side_left    = (p.trsm_side == CUBLAS_SIDE_LEFT);
-        cublasOperation_t op_h   = ((fill22_upper ^ side_left)) ? CUBLAS_OP_T : CUBLAS_OP_N;
-        cublasSideMode_t  h_side = side_left ? CUBLAS_SIDE_RIGHT : CUBLAS_SIDE_LEFT;
-
-        CHK_CB(cublasStrsm(cb,
-            h_side, p.fill22, op_h, CUBLAS_DIAG_NON_UNIT,
-            m, n_blk, &one,
-            arf + p.off22, p.lda22,
-            h_buf, m));
     }
+    CHK_CB(cublasStrsm(cb,
+        h_side, p.fill22, op_h, CUBLAS_DIAG_NON_UNIT,
+        m, n_blk, &one,
+        arf + p.off22, p.lda22,
+        h_buf, m));
 
     /* ---- Step 4: SPOTRI on block22 → P22 = A^{-1}[2,2] ---------------- */
-    CHK_CU(cudaMemset(devInfo, 0, sizeof(int)));
+    CHK_CU(cudaMemsetAsync(devInfo, 0, sizeof(int), stream));
     CHK_CS(cusolverDnSpotri(cs, p.fill22, p.dim22,
                              arf + p.off22, p.lda22, work, lwork, devInfo));
-    CHK_CU(cudaMemcpy(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
+    CHK_CU(cudaMemcpyAsync(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CHK_CU(cudaStreamSynchronize(stream));
     if (h_info != 0) { status = CURFP_STATUS_EXECUTION_FAILED; goto cleanup; }
 
     /* ---- Step 5: SPOTRI on block11 → A11^{-1} (intermediate) ---------- */
-    CHK_CU(cudaMemset(devInfo, 0, sizeof(int)));
+    CHK_CU(cudaMemsetAsync(devInfo, 0, sizeof(int), stream));
     CHK_CS(cusolverDnSpotri(cs, p.fill11, p.dim11,
                              arf + p.off11, p.lda11, work, lwork, devInfo));
-    CHK_CU(cudaMemcpy(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
+    CHK_CU(cudaMemcpyAsync(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CHK_CU(cudaStreamSynchronize(stream));
     if (h_info != 0) { status = CURFP_STATUS_EXECUTION_FAILED; goto cleanup; }
 
     /* ---- Step 6: Correct block11 using SSYRK(fill11)
@@ -395,9 +380,9 @@ curfpStatus_t curfpSpftri(curfpHandle_t    handle,
 #undef CHK_CU
 
 cleanup:
-    cudaFree(work);
-    cudaFree(g_buf);
-    cudaFree(h_buf);
-    cudaFree(devInfo);
+    cudaFreeAsync(work,    stream);
+    cudaFreeAsync(g_buf,   stream);
+    cudaFreeAsync(h_buf,   stream);
+    cudaFreeAsync(devInfo, stream);
     return status;
 }

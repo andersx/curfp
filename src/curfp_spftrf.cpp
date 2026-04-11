@@ -223,10 +223,13 @@ curfpStatus_t curfpSpftrf(
     int lwork = (lwork11 > lwork22) ? lwork11 : lwork22;
     if (lwork < 1) lwork = 1;   /* cudaMalloc(0) is implementation-defined */
 
+    cudaStream_t stream;
+    CURFP_CHECK_CUBLAS(cublasGetStream(cb, &stream));
+
     float *work    = NULL;
     int   *devInfo = NULL;
-    CURFP_CHECK_CUDA(cudaMalloc((void **)&work,    (size_t)lwork * sizeof(float)));
-    CURFP_CHECK_CUDA(cudaMalloc((void **)&devInfo, sizeof(int)));
+    CURFP_CHECK_CUDA(cudaMallocAsync((void **)&work,    (size_t)lwork * sizeof(float), stream));
+    CURFP_CHECK_CUDA(cudaMallocAsync((void **)&devInfo, sizeof(int),                   stream));
 
     curfpStatus_t st    = CURFP_STATUS_SUCCESS;
     int           h_info = 0;
@@ -249,10 +252,11 @@ curfpStatus_t curfpSpftrf(
     } while (0)
 
     /* 1. SPOTRF on block 11 */
-    CHK_CU(cudaMemset(devInfo, 0, sizeof(int)));
+    CHK_CU(cudaMemsetAsync(devInfo, 0, sizeof(int), stream));
     CHK_CS(cusolverDnSpotrf(cs, p.fill11, p.dim11,
                              A + p.off11, p.lda11, work, lwork, devInfo));
-    CHK_CU(cudaMemcpy(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
+    CHK_CU(cudaMemcpyAsync(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CHK_CU(cudaStreamSynchronize(stream));
     if (h_info != 0) { *info = h_info; goto cleanup; }
 
     /* 2. STRSM: solve triangular system to update off-diagonal block */
@@ -270,10 +274,11 @@ curfpStatus_t curfpSpftrf(
         &one, A + p.syrk_c_off, p.syrk_ldc));
 
     /* 4. SPOTRF on block 22 (reuse work + devInfo) */
-    CHK_CU(cudaMemset(devInfo, 0, sizeof(int)));
+    CHK_CU(cudaMemsetAsync(devInfo, 0, sizeof(int), stream));
     CHK_CS(cusolverDnSpotrf(cs, p.fill22, p.dim22,
                              A + p.off22, p.lda22, work, lwork, devInfo));
-    CHK_CU(cudaMemcpy(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost));
+    CHK_CU(cudaMemcpyAsync(&h_info, devInfo, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CHK_CU(cudaStreamSynchronize(stream));
     if (h_info != 0) { *info = h_info + p.info22_offset; goto cleanup; }
 
 #undef CHK_CS
@@ -281,7 +286,7 @@ curfpStatus_t curfpSpftrf(
 #undef CHK_CU
 
 cleanup:
-    cudaFree(work);
-    cudaFree(devInfo);
+    cudaFreeAsync(work,    stream);
+    cudaFreeAsync(devInfo, stream);
     return st;
 }

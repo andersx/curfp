@@ -7,184 +7,124 @@
  * Only the triangle specified by UPLO is written; the other triangle
  * is not touched (caller should zero-initialize A if needed).
  *
- * 8 RFP storage variants (N parity × TRANSR N/T × UPLO L/U).
- * Kernels are identical to curfp_strttf.cu with src/dst swapped.
+ * Unified 2D kernel: one thread per triangular element of A.
+ * Exact mirror of curfp_strttf.cu with src/dst swapped:
+ *   strttf: arf[arf_idx]         = A[row*lda + col]
+ *   stfttr: A[row*lda + col]     = arf[arf_idx]
  *
- * Cases 4, 7, 8 previously required two sequential kernel launches; they have
- * been fused into single kernels (no data dependencies between the sub-regions).
+ * The RFP index arithmetic is identical to strttf — see that file for the
+ * full derivation of arf_idx from (row, col) in each of the 8 cases.
  */
 
 #include "curfp_internal.h"
 
-#define A_RM(r, c, lda) ((r) * (lda) + (c))
+#define TX 32
+#define TY 8
 
-#define KL_CHECK() \
-    do { \
-        cudaError_t _ke = cudaGetLastError(); \
-        if (_ke != cudaSuccess) return CURFP_STATUS_EXECUTION_FAILED; \
-    } while (0)
-
-static const int BLOCK = 256;
-
-/* ================================================================ Case 1 */
-static __global__ void k_stfttr_odd_N_L(const float* __restrict__ arf,
-                                         float* __restrict__ A,
-                                         int n, int n1, int n2, int lda)
+static __global__ void k_stfttr(
+    const float * __restrict__ arf,
+    float       * __restrict__ A,
+    int n, int lda,
+    int nisodd, int normaltransr, int lower,
+    int n1, int n2, int nk, int nt)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j > n2) return;
+    int col = blockIdx.x * TX + threadIdx.x;
+    int row = blockIdx.y * TY + threadIdx.y;
 
-    for (int i = n1; i <= n2 + j; i++)
-        A[A_RM(n2 + j, i, lda)] = arf[j * n + (i - n1)];
+    if (col >= n || row >= n) return;
 
-    for (int i = j; i < n; i++)
-        A[A_RM(i, j, lda)] = arf[j * n + i];
-}
-
-/* ================================================================ Case 2 */
-static __global__ void k_stfttr_odd_N_U(const float* __restrict__ arf,
-                                         float* __restrict__ A,
-                                         int n, int n1, int n2,
-                                         int nt, int lda)
-{
-    int j_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j_idx >= n2) return;
-
-    int j = n - 1 - j_idx;
-    int ij0 = nt - (n - j) * n;
-
-    for (int i = 0; i <= j; i++)
-        A[A_RM(i, j, lda)] = arf[ij0 + i];
-
-    for (int l = j - n1; l <= n1 - 1; l++)
-        A[A_RM(j - n1, l, lda)] = arf[ij0 + (j + 1) + (l - (j - n1))];
-}
-
-/* ================================================================ Case 3 */
-static __global__ void k_stfttr_odd_T_L(const float* __restrict__ arf,
-                                         float* __restrict__ A,
-                                         int n, int n1, int n2, int lda)
-{
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= n) return;
-
-    int ij0 = j * n1;
-
-    if (j < n2) {
-        for (int i = 0; i <= j; i++)
-            A[A_RM(j, i, lda)] = arf[ij0 + i];
-        for (int i = n1 + j; i < n; i++)
-            A[A_RM(i, n1 + j, lda)] = arf[ij0 + (i - n1 + 1)];
+    if (lower) {
+        if (col > row) return;
     } else {
-        for (int i = 0; i < n1; i++)
-            A[A_RM(j, i, lda)] = arf[ij0 + i];
+        if (row > col) return;
     }
-}
 
-/* ================================================================ Case 4 [fused] */
-static __global__ void k_stfttr_odd_T_U(const float* __restrict__ arf,
-                                          float* __restrict__ A,
-                                          int n, int n1, int n2, int lda)
-{
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j > n1) return;
+    long arf_idx = -1;
 
-    /* A-part */
-    int ij0 = j * n2;
-    for (int i = n1; i < n; i++)
-        A[A_RM(j, i, lda)] = arf[ij0 + (i - n1)];
-
-    /* B-part */
-    if (j < n1) {
-        int ij1 = (n1 + 1) * n2 + j * (n1 + 1);
-        for (int i = 0; i <= j; i++)
-            A[A_RM(i, j, lda)] = arf[ij1 + i];
-        for (int l = n2 + j; l < n; l++)
-            A[A_RM(n2 + j, l, lda)] = arf[ij1 + (j + 1) + (l - (n2 + j))];
-    }
-}
-
-/* ================================================================ Case 5 */
-static __global__ void k_stfttr_even_N_L(const float* __restrict__ arf,
-                                          float* __restrict__ A,
-                                          int n, int k, int lda)
-{
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= k) return;
-
-    int ij0 = j * (n + 1);
-
-    for (int i = k; i <= k + j; i++)
-        A[A_RM(k + j, i, lda)] = arf[ij0 + (i - k)];
-
-    for (int i = j; i < n; i++)
-        A[A_RM(i, j, lda)] = arf[ij0 + i + 1];
-}
-
-/* ================================================================ Case 6 */
-static __global__ void k_stfttr_even_N_U(const float* __restrict__ arf,
-                                          float* __restrict__ A,
-                                          int n, int k, int nt, int lda)
-{
-    int j_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int j = k + j_idx;
-    if (j >= n) return;
-
-    int ij0 = nt - (n + 1) * (n - j);
-
-    for (int i = 0; i <= j; i++)
-        A[A_RM(i, j, lda)] = arf[ij0 + i];
-
-    for (int l = j - k; l <= k - 1; l++)
-        A[A_RM(j - k, l, lda)] = arf[ij0 + k + 1 + l];
-}
-
-/* ================================================================ Case 7 [fused] */
-static __global__ void k_stfttr_even_T_L(const float* __restrict__ arf,
-                                           float* __restrict__ A,
-                                           int n, int k, int lda)
-{
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= n) return;
-
-    /* col part: A[K+j, K] = arf[j]  (j=0..K-1) */
-    if (j < k)
-        A[A_RM(k + j, k, lda)] = arf[j];
-
-    /* main part */
-    int ij0 = k * (j + 1);
-    if (j < k - 1) {
-        for (int i = 0; i <= j; i++)
-            A[A_RM(j, i, lda)] = arf[ij0 + i];
-        for (int i = k + 1 + j; i < n; i++)
-            A[A_RM(i, k + 1 + j, lda)] = arf[ij0 + (i - k)];
+    if (nisodd) {
+        if (normaltransr) {
+            if (lower) {
+                /* Case 1: TRANSR='N', UPLO='L' */
+                if (col >= n1 && row >= n2) {
+                    arf_idx = (long)(row - n2) * n + (col - n1);
+                } else {
+                    arf_idx = (long)col * n + row;
+                }
+            } else {
+                /* Case 2: TRANSR='N', UPLO='U' */
+                if (col >= n1) {
+                    long ij0 = (long)nt - (long)(n - col) * n;
+                    arf_idx = ij0 + row;
+                } else {
+                    long ij0 = (long)nt - (long)(n2 - row) * n;
+                    arf_idx = ij0 + (long)(n1 + 1 + col);
+                }
+            }
+        } else {
+            if (lower) {
+                /* Case 3: TRANSR='T', UPLO='L' */
+                if (col < n1) {
+                    arf_idx = (long)row * n1 + col;
+                } else {
+                    arf_idx = (long)(col - n1) * n1 + (row - n1 + 1);
+                }
+            } else {
+                /* Case 4: TRANSR='T', UPLO='U' */
+                if (col >= n1 && row <= n1) {
+                    arf_idx = (long)row * n2 + (col - n1);
+                } else if (col < n1) {
+                    arf_idx = (long)(n1 + 1) * n2 + (long)col * (n1 + 1) + row;
+                } else {
+                    long ij1 = (long)(n1 + 1) * n2 + (long)(row - n2) * (n1 + 1);
+                    arf_idx = ij1 + (row - n2 + 1) + (col - row);
+                }
+            }
+        }
     } else {
-        for (int i = 0; i < k; i++)
-            A[A_RM(j, i, lda)] = arf[ij0 + i];
+        if (normaltransr) {
+            if (lower) {
+                /* Case 5: TRANSR='N', UPLO='L' */
+                if (col >= nk) {
+                    arf_idx = (long)(row - nk) * (n + 1) + (col - nk);
+                } else {
+                    arf_idx = (long)col * (n + 1) + row + 1;
+                }
+            } else {
+                /* Case 6: TRANSR='N', UPLO='U' */
+                if (col >= nk) {
+                    arf_idx = (long)nt - (long)(n + 1) * (n - col) + row;
+                } else {
+                    arf_idx = (long)nt - (long)(n + 1) * (nk - row) + (nk + 1 + col);
+                }
+            }
+        } else {
+            if (lower) {
+                /* Case 7: TRANSR='T', UPLO='L' */
+                if (col == nk && row >= nk) {
+                    arf_idx = row - nk;
+                } else if (col < nk) {
+                    arf_idx = (long)nk * (row + 1) + col;
+                } else {
+                    /* col > nk */
+                    arf_idx = (long)nk * (col - nk) + (row - nk);
+                }
+            } else {
+                /* Case 8: TRANSR='T', UPLO='U' */
+                if (col >= nk && row <= nk) {
+                    arf_idx = (long)row * nk + (col - nk);
+                } else if (col < nk) {
+                    arf_idx = (long)nk * (nk + 1) + (long)col * nk + row;
+                } else {
+                    /* col>=nk, row>=nk+1: B-part second */
+                    long ij1 = (long)nk * (nk + 1) + (long)(row - nk - 1) * nk;
+                    arf_idx = ij1 + (row - nk) + (col - row);
+                }
+            }
+        }
     }
-}
 
-/* ================================================================ Case 8 [fused] */
-static __global__ void k_stfttr_even_T_U(const float* __restrict__ arf,
-                                           float* __restrict__ A,
-                                           int n, int k, int lda)
-{
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j > k) return;
-
-    /* A-part */
-    int ij0 = j * k;
-    for (int i = k; i < n; i++)
-        A[A_RM(j, i, lda)] = arf[ij0 + (i - k)];
-
-    /* B-part */
-    if (j < k) {
-        int ij1 = k * (k + 1) + j * k;
-        for (int i = 0; i <= j; i++)
-            A[A_RM(i, j, lda)] = arf[ij1 + i];
-        for (int l = k + 1 + j; l < n; l++)
-            A[A_RM(k + 1 + j, l, lda)] = arf[ij1 + (j + 1) + (l - (k + 1 + j))];
-    }
+    if (arf_idx >= 0)
+        A[(long)row * lda + col] = arf[arf_idx];
 }
 
 /* ================================================================
@@ -216,62 +156,20 @@ curfpStatus_t curfpSstfttr(curfpHandle_t    handle,
     int normaltransr = (transr == CURFP_OP_N);
     int lower        = (uplo == CURFP_FILL_MODE_LOWER);
 
-    int n1, n2, k = 0, nt;
+    int n1 = 0, n2 = 0, nk = 0;
     if (lower) { n2 = n / 2; n1 = n - n2; }
     else       { n1 = n / 2; n2 = n - n1; }
-    if (!nisodd) k = n / 2;
-    nt = n * (n + 1) / 2;
+    if (!nisodd) nk = n / 2;
+    int nt = n * (n + 1) / 2;
 
-    auto grid = [](int threads) {
-        return (threads + BLOCK - 1) / BLOCK;
-    };
+    dim3 block(TX, TY);
+    dim3 grid((n + TX - 1) / TX, (n + TY - 1) / TY);
 
-    if (nisodd) {
-        if (normaltransr) {
-            if (lower) {
-                k_stfttr_odd_N_L<<<grid(n2 + 1), BLOCK, 0, stream>>>(
-                    arf, A, n, n1, n2, lda);
-            } else {
-                k_stfttr_odd_N_U<<<grid(n2), BLOCK, 0, stream>>>(
-                    arf, A, n, n1, n2, nt, lda);
-            }
-            KL_CHECK();
-        } else {
-            if (lower) {
-                k_stfttr_odd_T_L<<<grid(n), BLOCK, 0, stream>>>(
-                    arf, A, n, n1, n2, lda);
-                KL_CHECK();
-            } else {
-                /* Case 4 (fused) */
-                k_stfttr_odd_T_U<<<grid(n1 + 1), BLOCK, 0, stream>>>(
-                    arf, A, n, n1, n2, lda);
-                KL_CHECK();
-            }
-        }
-    } else {
-        if (normaltransr) {
-            if (lower) {
-                k_stfttr_even_N_L<<<grid(k), BLOCK, 0, stream>>>(
-                    arf, A, n, k, lda);
-            } else {
-                k_stfttr_even_N_U<<<grid(k), BLOCK, 0, stream>>>(
-                    arf, A, n, k, nt, lda);
-            }
-            KL_CHECK();
-        } else {
-            if (lower) {
-                /* Case 7 (fused) */
-                k_stfttr_even_T_L<<<grid(n), BLOCK, 0, stream>>>(
-                    arf, A, n, k, lda);
-                KL_CHECK();
-            } else {
-                /* Case 8 (fused) */
-                k_stfttr_even_T_U<<<grid(k + 1), BLOCK, 0, stream>>>(
-                    arf, A, n, k, lda);
-                KL_CHECK();
-            }
-        }
-    }
+    k_stfttr<<<grid, block, 0, stream>>>(
+        arf, A, n, lda, nisodd, normaltransr, lower, n1, n2, nk, nt);
+
+    cudaError_t ke = cudaGetLastError();
+    if (ke != cudaSuccess) return CURFP_STATUS_EXECUTION_FAILED;
 
     return CURFP_STATUS_SUCCESS;
 }

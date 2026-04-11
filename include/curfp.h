@@ -36,6 +36,14 @@ typedef enum {
 } curfpFillMode_t;
 
 /* ---------------------------------------------------------------------------
+ * Side mode (left or right) for curfpSsfmm
+ * ---------------------------------------------------------------------------*/
+typedef enum {
+    CURFP_SIDE_LEFT  = 0,  /* C = alpha * A * B + beta * C */
+    CURFP_SIDE_RIGHT = 1   /* C = alpha * B * A + beta * C */
+} curfpSideMode_t;
+
+/* ---------------------------------------------------------------------------
  * Norm type for curfpSlansf
  * ---------------------------------------------------------------------------*/
 typedef enum {
@@ -239,6 +247,104 @@ curfpStatus_t curfpSpfcon(
     const float     *arf,      /* device pointer, RFP Cholesky factor           */
     float            anorm,    /* 1-norm of original matrix before factorization */
     float           *rcond     /* host pointer output: reciprocal condition no. */
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpSsfr — Symmetric Rank-1 update in RFP format (single precision)
+ *
+ * Computes:  C := alpha * x * x^T + C
+ *
+ * C is an n×n symmetric matrix stored in RFP format (n*(n+1)/2 floats on
+ * device).  x is a device vector of length n.
+ * alpha is a host pointer; x and arf are device pointers.
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpSsfr(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,   /* RFP storage variant: CURFP_OP_N or CURFP_OP_T */
+    curfpFillMode_t  uplo,     /* CURFP_FILL_MODE_LOWER or CURFP_FILL_MODE_UPPER */
+    int              n,        /* order of symmetric matrix C                    */
+    const float     *alpha,    /* host pointer                                   */
+    const float     *x,        /* device pointer, vector of length n             */
+    int              incx,     /* stride for x (usually 1)                       */
+    float           *arf       /* device pointer, RFP format, n*(n+1)/2 floats  */
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpSsfr2 — Symmetric Rank-2 update in RFP format (single precision)
+ *
+ * Computes:  C := alpha * x * y^T + alpha * y * x^T + C
+ *
+ * C is an n×n symmetric matrix stored in RFP format (n*(n+1)/2 floats on
+ * device).  x and y are device vectors of length n.
+ * alpha is a host pointer; x, y, and arf are device pointers.
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpSsfr2(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,   /* RFP storage variant: CURFP_OP_N or CURFP_OP_T */
+    curfpFillMode_t  uplo,     /* CURFP_FILL_MODE_LOWER or CURFP_FILL_MODE_UPPER */
+    int              n,        /* order of symmetric matrix C                    */
+    const float     *alpha,    /* host pointer                                   */
+    const float     *x,        /* device pointer, vector of length n             */
+    int              incx,     /* stride for x (usually 1)                       */
+    const float     *y,        /* device pointer, vector of length n             */
+    int              incy,     /* stride for y (usually 1)                       */
+    float           *arf       /* device pointer, RFP format, n*(n+1)/2 floats  */
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpSsfr2k — Symmetric Rank-2K update in RFP format (single precision)
+ *
+ * Computes:
+ *   trans == CURFP_OP_N:  C := alpha*A*B^T + alpha*B*A^T + beta*C  (A,B are n×k)
+ *   trans == CURFP_OP_T:  C := alpha*A^T*B + alpha*B^T*A + beta*C  (A,B are k×n)
+ *
+ * C is an n×n symmetric matrix stored in RFP format (n*(n+1)/2 floats on
+ * device).  A and B are dense matrices with the same shape and leading dim.
+ * alpha and beta are host pointers; A, B, and C are device pointers.
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpSsfr2k(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,   /* RFP storage variant: CURFP_OP_N or CURFP_OP_T */
+    curfpFillMode_t  uplo,     /* CURFP_FILL_MODE_LOWER or CURFP_FILL_MODE_UPPER */
+    curfpOperation_t trans,    /* operation on A and B: CURFP_OP_N or CURFP_OP_T */
+    int              n,        /* order of symmetric matrix C                    */
+    int              k,        /* inner dimension                                */
+    const float     *alpha,    /* host pointer                                   */
+    const float     *A,        /* device pointer, leading dimension lda          */
+    int              lda,
+    const float     *B,        /* device pointer, leading dimension ldb          */
+    int              ldb,
+    const float     *beta,     /* host pointer                                   */
+    float           *C         /* device pointer, RFP format, n*(n+1)/2 floats  */
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpSsfmm — Symmetric matrix-matrix multiply in RFP format (single prec.)
+ *
+ * Computes:
+ *   side == CURFP_SIDE_LEFT:   C := alpha * A * B + beta * C
+ *   side == CURFP_SIDE_RIGHT:  C := alpha * B * A + beta * C
+ *
+ * A is a symmetric matrix in RFP format.  B and C are dense m×n matrices
+ * with leading dimensions ldb and ldc respectively.
+ * If side == CURFP_SIDE_LEFT,  A is m×m (n*(n+1)/2 = m*(m+1)/2 floats).
+ * If side == CURFP_SIDE_RIGHT, A is n×n (n*(n+1)/2 floats).
+ * alpha and beta are host pointers; arf, B, and C are device pointers.
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpSsfmm(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,   /* RFP storage variant: CURFP_OP_N or CURFP_OP_T */
+    curfpFillMode_t  uplo,     /* CURFP_FILL_MODE_LOWER or CURFP_FILL_MODE_UPPER */
+    curfpSideMode_t  side,     /* CURFP_SIDE_LEFT or CURFP_SIDE_RIGHT            */
+    int              m,        /* rows of B and C                                */
+    int              n,        /* cols of B and C                                */
+    const float     *alpha,    /* host pointer                                   */
+    const float     *arf,      /* device pointer, RFP format                    */
+    const float     *B,        /* device pointer, m×n column-major, ldb >= m    */
+    int              ldb,
+    const float     *beta,     /* host pointer                                   */
+    float           *C,        /* device pointer, m×n column-major, ldc >= m    */
+    int              ldc
 );
 
 #ifdef __cplusplus

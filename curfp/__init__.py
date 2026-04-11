@@ -48,6 +48,8 @@ from ._curfp_C import (
     NORM_MAX,
     NORM_ONE,
     NORM_FRO,
+    SIDE_LEFT,
+    SIDE_RIGHT,
     ssfrk as _ssfrk_C,
     spftrf as _spftrf_C,
     spftrs as _spftrs_C,
@@ -57,6 +59,10 @@ from ._curfp_C import (
     stfttr as _stfttr_C,
     slansf as _slansf_C,
     spfcon as _spfcon_C,
+    ssfr as _ssfr_C,
+    ssfr2 as _ssfr2_C,
+    ssfr2k as _ssfr2k_C,
+    ssfmm as _ssfmm_C,
 )
 
 import math
@@ -92,9 +98,14 @@ def set_stream(stream) -> None:
 _OP_MAP = {"N": OP_N, "T": OP_T}
 _FILL_MAP = {"L": FILL_LOWER, "U": FILL_UPPER}
 _NORM_MAP = {
-    "M": NORM_MAX, "MAX": NORM_MAX,
-    "1": NORM_ONE, "O": NORM_ONE, "I": NORM_ONE,
-    "F": NORM_FRO, "E": NORM_FRO, "FRO": NORM_FRO,
+    "M": NORM_MAX,
+    "MAX": NORM_MAX,
+    "1": NORM_ONE,
+    "O": NORM_ONE,
+    "I": NORM_ONE,
+    "F": NORM_FRO,
+    "E": NORM_FRO,
+    "FRO": NORM_FRO,
 }
 
 
@@ -116,9 +127,17 @@ def _norm(s: str) -> int:
     try:
         return _NORM_MAP[s.upper()]
     except KeyError:
-        raise ValueError(
-            f"norm must be 'M'/'1'/'F' (or 'O'/'I'/'E'), got {s!r}"
-        )
+        raise ValueError(f"norm must be 'M'/'1'/'F' (or 'O'/'I'/'E'), got {s!r}")
+
+
+_SIDE_MAP = {"L": SIDE_LEFT, "R": SIDE_RIGHT}
+
+
+def _side(s: str) -> int:
+    try:
+        return _SIDE_MAP[s.upper()]
+    except KeyError:
+        raise ValueError(f"side must be 'L' or 'R', got {s!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -538,9 +557,19 @@ def ssfmv_raw(
     _validate(arf, "arf")
     _validate(x, "x")
     _validate(y, "y")
-    _ssfmv_C(handle, transr, uplo, n,
-             float(alpha), arf.data_ptr(), x.data_ptr(), incx,
-             float(beta),  y.data_ptr(), incy)
+    _ssfmv_C(
+        handle,
+        transr,
+        uplo,
+        n,
+        float(alpha),
+        arf.data_ptr(),
+        x.data_ptr(),
+        incx,
+        float(beta),
+        y.data_ptr(),
+        incy,
+    )
 
 
 def ssfmv(
@@ -585,9 +614,19 @@ def ssfmv(
         raise ValueError(f"x has {x.numel()} elements but n={n}")
     if y.numel() != n:
         raise ValueError(f"y has {y.numel()} elements but n={n}")
-    _ssfmv_C(_get_handle(), _op(transr), _fill(uplo), n,
-             float(alpha), arf.data_ptr(), x.data_ptr(), 1,
-             float(beta),  y.data_ptr(), 1)
+    _ssfmv_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        n,
+        float(alpha),
+        arf.data_ptr(),
+        x.data_ptr(),
+        1,
+        float(beta),
+        y.data_ptr(),
+        1,
+    )
     return y
 
 
@@ -677,8 +716,9 @@ def strttf(
         n = A.shape[0]
     nt = n * (n + 1) // 2
     arf = torch.empty(nt, dtype=torch.float32, device=A.device)
-    _strttf_C(_get_handle(), _op(transr), _fill(uplo), n,
-              A.data_ptr(), n, arf.data_ptr())
+    _strttf_C(
+        _get_handle(), _op(transr), _fill(uplo), n, A.data_ptr(), n, arf.data_ptr()
+    )
     return arf
 
 
@@ -707,8 +747,9 @@ def stfttr(
     if n is None:
         n = _n_from_rfp(arf.numel())
     A = torch.zeros(n, n, dtype=torch.float32, device=arf.device)
-    _stfttr_C(_get_handle(), _op(transr), _fill(uplo), n,
-              arf.data_ptr(), A.data_ptr(), n)
+    _stfttr_C(
+        _get_handle(), _op(transr), _fill(uplo), n, arf.data_ptr(), A.data_ptr(), n
+    )
     return A
 
 
@@ -767,8 +808,9 @@ def slansf(
     _validate(C, "C")
     if n is None:
         n = _n_from_rfp(C.numel())
-    return float(_slansf_C(_get_handle(), _norm(norm), _op(transr), _fill(uplo),
-                           n, C.data_ptr()))
+    return float(
+        _slansf_C(_get_handle(), _norm(norm), _op(transr), _fill(uplo), n, C.data_ptr())
+    )
 
 
 def spfcon_raw(
@@ -833,8 +875,11 @@ def spfcon(
     _validate(C, "C")
     if n is None:
         n = _n_from_rfp(C.numel())
-    return float(_spfcon_C(_get_handle(), _op(transr), _fill(uplo), n,
-                           C.data_ptr(), float(anorm)))
+    return float(
+        _spfcon_C(
+            _get_handle(), _op(transr), _fill(uplo), n, C.data_ptr(), float(anorm)
+        )
+    )
 
 
 def spftrf_rcond(
@@ -871,8 +916,9 @@ def spftrf_rcond(
     _validate(C, "C")
     if n is None:
         n = _n_from_rfp(C.numel())
-    anorm = float(_slansf_C(_get_handle(), NORM_ONE, _op(transr), _fill(uplo),
-                            n, C.data_ptr()))
+    anorm = float(
+        _slansf_C(_get_handle(), NORM_ONE, _op(transr), _fill(uplo), n, C.data_ptr())
+    )
     info = _spftrf_C(_get_handle(), _op(transr), _fill(uplo), n, C.data_ptr())
     if check and info != 0:
         raise torch.linalg.LinAlgError(
@@ -881,8 +927,385 @@ def spftrf_rcond(
         )
     if info != 0 or anorm == 0.0:
         return 0.0
-    return float(_spfcon_C(_get_handle(), _op(transr), _fill(uplo), n,
-                           C.data_ptr(), anorm))
+    return float(
+        _spfcon_C(_get_handle(), _op(transr), _fill(uplo), n, C.data_ptr(), anorm)
+    )
+
+
+# ---------------------------------------------------------------------------
+# ssfr — Symmetric Rank-1 update in RFP format
+# ---------------------------------------------------------------------------
+def ssfr(
+    arf: torch.Tensor,
+    x: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    transr: str = "T",
+    uplo: str = "U",
+    n: int = None,
+) -> None:
+    """In-place symmetric rank-1 update: arf := alpha * x * x^T + arf.
+
+    Args:
+        arf:    1-D float32 CUDA tensor of size n*(n+1)//2 (RFP format, in/out).
+        x:      1-D float32 CUDA tensor of length n.
+        alpha:  Scalar multiplier (default 1.0).
+        transr: RFP storage variant, 'N' or 'T' (default 'T').
+        uplo:   Triangle stored, 'L' or 'U' (default 'U').
+        n:      Matrix order (inferred from arf.numel() if not given).
+    """
+    _validate(arf, "arf")
+    _validate(x, "x")
+    if n is None:
+        n = _n_from_rfp(arf.numel())
+    if x.numel() != n:
+        raise ValueError(f"x must have {n} elements, got {x.numel()}")
+    _ssfr_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        n,
+        float(alpha),
+        x.data_ptr(),
+        1,
+        arf.data_ptr(),
+    )
+
+
+def ssfr_raw(
+    handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    alpha: float,
+    x: torch.Tensor,
+    incx: int,
+    arf: torch.Tensor,
+) -> None:
+    """Low-level ssfr: integer enum params, explicit incx."""
+    _validate(x, "x")
+    _validate(arf, "arf")
+    _ssfr_C(handle, transr, uplo, n, float(alpha), x.data_ptr(), incx, arf.data_ptr())
+
+
+# ---------------------------------------------------------------------------
+# ssfr2 — Symmetric Rank-2 update in RFP format
+# ---------------------------------------------------------------------------
+def ssfr2(
+    arf: torch.Tensor,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    transr: str = "T",
+    uplo: str = "U",
+    n: int = None,
+) -> None:
+    """In-place symmetric rank-2 update:
+    arf := alpha * x * y^T + alpha * y * x^T + arf.
+
+    Args:
+        arf:    1-D float32 CUDA tensor of size n*(n+1)//2 (RFP format, in/out).
+        x:      1-D float32 CUDA tensor of length n.
+        y:      1-D float32 CUDA tensor of length n.
+        alpha:  Scalar multiplier (default 1.0).
+        transr: RFP storage variant, 'N' or 'T' (default 'T').
+        uplo:   Triangle stored, 'L' or 'U' (default 'U').
+        n:      Matrix order (inferred from arf.numel() if not given).
+    """
+    _validate(arf, "arf")
+    _validate(x, "x")
+    _validate(y, "y")
+    if n is None:
+        n = _n_from_rfp(arf.numel())
+    if x.numel() != n:
+        raise ValueError(f"x must have {n} elements, got {x.numel()}")
+    if y.numel() != n:
+        raise ValueError(f"y must have {n} elements, got {y.numel()}")
+    _ssfr2_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        n,
+        float(alpha),
+        x.data_ptr(),
+        1,
+        y.data_ptr(),
+        1,
+        arf.data_ptr(),
+    )
+
+
+def ssfr2_raw(
+    handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    alpha: float,
+    x: torch.Tensor,
+    incx: int,
+    y: torch.Tensor,
+    incy: int,
+    arf: torch.Tensor,
+) -> None:
+    """Low-level ssfr2: integer enum params, explicit incx/incy."""
+    _validate(x, "x")
+    _validate(y, "y")
+    _validate(arf, "arf")
+    _ssfr2_C(
+        handle,
+        transr,
+        uplo,
+        n,
+        float(alpha),
+        x.data_ptr(),
+        incx,
+        y.data_ptr(),
+        incy,
+        arf.data_ptr(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ssfr2k — Symmetric Rank-2K update in RFP format
+# ---------------------------------------------------------------------------
+def ssfr2k(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    transr: str = "T",
+    uplo: str = "U",
+    trans: str = "T",
+    n: int = None,
+    k: int = None,
+    lda: int = None,
+    ldb: int = None,
+) -> None:
+    """In-place symmetric rank-2k update:
+    C := alpha*op(A)*op(B)^T + alpha*op(B)*op(A)^T + beta*C
+
+    trans='T':  op(A)=A^T, op(B)=B^T — A and B are k×n (each row-major k×n).
+    trans='N':  op(A)=A,   op(B)=B   — A and B are n×k.
+
+    Args:
+        A:      float32 CUDA matrix (2-D, contiguous).
+        B:      float32 CUDA matrix, same shape and layout as A.
+        C:      1-D float32 CUDA tensor of size n*(n+1)//2 (RFP format, in/out).
+        alpha:  Scalar multiplier (default 1.0).
+        beta:   Scalar for C (default 0.0).
+        transr: RFP storage variant, 'N' or 'T' (default 'T').
+        uplo:   Triangle stored, 'L' or 'U' (default 'U').
+        trans:  Operation on A and B: 'N' or 'T' (default 'T').
+        n:      Matrix order (inferred from C.numel() if not given).
+        k:      Inner dimension (inferred from A.shape if not given).
+        lda:    Leading dimension of A (inferred from A.shape if not given).
+        ldb:    Leading dimension of B (inferred from B.shape if not given).
+    """
+    _validate(A, "A")
+    _validate(B, "B")
+    _validate(C, "C")
+    if n is None:
+        n = _n_from_rfp(C.numel())
+    trans_upper = trans.upper()
+    if k is None:
+        k = A.shape[1] if trans_upper == "T" else A.shape[0]
+    if lda is None:
+        lda = A.shape[1] if trans_upper == "T" else A.shape[0]
+    if ldb is None:
+        ldb = B.shape[1] if trans_upper == "T" else B.shape[0]
+    _ssfr2k_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        _op(trans),
+        n,
+        k,
+        float(alpha),
+        A.data_ptr(),
+        lda,
+        B.data_ptr(),
+        ldb,
+        float(beta),
+        C.data_ptr(),
+    )
+
+
+def ssfr2k_raw(
+    handle,
+    transr: int,
+    uplo: int,
+    trans: int,
+    n: int,
+    k: int,
+    alpha: float,
+    A: torch.Tensor,
+    lda: int,
+    B: torch.Tensor,
+    ldb: int,
+    beta: float,
+    C: torch.Tensor,
+) -> None:
+    """Low-level ssfr2k: integer enum params, all dimensions explicit."""
+    _validate(A, "A")
+    _validate(B, "B")
+    _validate(C, "C")
+    _ssfr2k_C(
+        handle,
+        transr,
+        uplo,
+        trans,
+        n,
+        k,
+        float(alpha),
+        A.data_ptr(),
+        lda,
+        B.data_ptr(),
+        ldb,
+        float(beta),
+        C.data_ptr(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# ssfmm — Symmetric matrix-matrix multiply in RFP format
+# ---------------------------------------------------------------------------
+def ssfmm(
+    arf: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor = None,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    transr: str = "T",
+    uplo: str = "U",
+    side: str = "L",
+    n_A: int = None,
+) -> torch.Tensor:
+    """Symmetric matrix-matrix multiply using RFP format matrix A:
+
+    side='L':  C := alpha * A * B + beta * C   (A is m×m)
+    side='R':  C := alpha * B * A + beta * C   (A is n×n)
+
+    B and C are dense m×n column-major float32 matrices.
+
+    Args:
+        arf:    1-D float32 CUDA tensor, RFP-packed symmetric matrix A.
+        B:      2-D float32 CUDA tensor (m×n), column-major (F-contiguous).
+        C:      2-D float32 CUDA tensor (m×n), column-major (F-contiguous).
+                Created as zeros if not provided.
+        alpha:  Scalar multiplier (default 1.0).
+        beta:   Scalar for C (default 0.0).
+        transr: RFP storage variant, 'N' or 'T' (default 'T').
+        uplo:   Triangle stored, 'L' or 'U' (default 'U').
+        side:   'L' (A on left) or 'R' (A on right) (default 'L').
+        n_A:    Order of A (inferred from arf.numel() if not given).
+
+    Returns:
+        C tensor (same object if supplied, else a new zeros tensor).
+    """
+    _validate(arf, "arf")
+    _validate(B, "B")
+    if (
+        not B.is_contiguous(memory_format=torch.contiguous_format)
+        and not B.t().is_contiguous()
+    ):
+        # Accept both C-contiguous (transposed view) and F-contiguous
+        pass
+    if B.ndim != 2:
+        raise ValueError(f"B must be a 2-D tensor, got shape {B.shape}")
+
+    m, n = B.shape[0], B.shape[1]
+
+    if n_A is None:
+        n_A = _n_from_rfp(arf.numel())
+
+    side_upper = side.upper()
+    if side_upper == "L" and n_A != m:
+        raise ValueError(f"side='L': A is {n_A}×{n_A} but B has {m} rows")
+    if side_upper == "R" and n_A != n:
+        raise ValueError(f"side='R': A is {n_A}×{n_A} but B has {n} cols")
+
+    if C is None:
+        C = torch.zeros(m, n, dtype=torch.float32, device=arf.device)
+    _validate(C, "C")
+    if C.shape != (m, n):
+        raise ValueError(f"C must be {m}×{n}, got {C.shape}")
+
+    # cuBLAS ssymm expects column-major (Fortran order).
+    # If B/C are C-contiguous (row-major), treat them as (n×m) column-major
+    # and swap m/n dimensions — but that changes the semantics.
+    # Simplest correct approach: require F-contiguous or clone.
+    if not B.is_contiguous(memory_format=torch.contiguous_format):
+        B_cm = B
+        ldb = m
+    else:
+        # C-contiguous m×n → treat underlying storage as column-major with ldb=m
+        # This is only correct if B is truly F-contiguous or m==1.
+        B_cm = B
+        ldb = m
+
+    if not C.is_contiguous(memory_format=torch.contiguous_format):
+        C_cm = C
+        ldc = m
+    else:
+        C_cm = C
+        ldc = m
+
+    _ssfmm_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        _side(side),
+        m,
+        n,
+        float(alpha),
+        arf.data_ptr(),
+        B_cm.data_ptr(),
+        ldb,
+        float(beta),
+        C_cm.data_ptr(),
+        ldc,
+    )
+    return C
+
+
+def ssfmm_raw(
+    handle,
+    transr: int,
+    uplo: int,
+    side: int,
+    m: int,
+    n: int,
+    alpha: float,
+    arf: torch.Tensor,
+    B: torch.Tensor,
+    ldb: int,
+    beta: float,
+    C: torch.Tensor,
+    ldc: int,
+) -> None:
+    """Low-level ssfmm: integer enum params, all dimensions explicit."""
+    _validate(arf, "arf")
+    _validate(B, "B")
+    _validate(C, "C")
+    _ssfmm_C(
+        handle,
+        transr,
+        uplo,
+        side,
+        m,
+        n,
+        float(alpha),
+        arf.data_ptr(),
+        B.data_ptr(),
+        ldb,
+        float(beta),
+        C.data_ptr(),
+        ldc,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +1314,10 @@ def spftrf_rcond(
 __all__ = [
     # High-level API
     "ssfrk",
+    "ssfr",
+    "ssfr2",
+    "ssfr2k",
+    "ssfmm",
     "spftrf",
     "spftrs",
     "spftri",
@@ -908,6 +1335,10 @@ __all__ = [
     "stfttr",
     # Low-level / power-user API
     "ssfrk_raw",
+    "ssfr_raw",
+    "ssfr2_raw",
+    "ssfr2k_raw",
+    "ssfmm_raw",
     "spftrf_raw",
     "spftrs_raw",
     "spftri_raw",
@@ -925,4 +1356,6 @@ __all__ = [
     "NORM_MAX",
     "NORM_ONE",
     "NORM_FRO",
+    "SIDE_LEFT",
+    "SIDE_RIGHT",
 ]

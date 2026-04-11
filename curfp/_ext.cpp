@@ -270,6 +270,129 @@ float spfcon(Handle  &handle,
 }
 
 /* =========================================================================
+ * ssfr: symmetric rank-1 update in RFP format
+ *
+ * C := alpha * x * x^T + C
+ * arf_ptr, x_ptr: raw device pointers (int64)
+ * =========================================================================*/
+void ssfr(Handle  &handle,
+          int      transr,
+          int      uplo,
+          int      n,
+          float    alpha,
+          int64_t  x_ptr,
+          int      incx,
+          int64_t  arf_ptr)
+{
+    check_status(curfpSsfr(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        &alpha,
+        reinterpret_cast<const float *>(x_ptr),
+        incx,
+        reinterpret_cast<float *>(arf_ptr)));
+}
+
+/* =========================================================================
+ * ssfr2: symmetric rank-2 update in RFP format
+ *
+ * C := alpha * x * y^T + alpha * y * x^T + C
+ * arf_ptr, x_ptr, y_ptr: raw device pointers (int64)
+ * =========================================================================*/
+void ssfr2(Handle  &handle,
+           int      transr,
+           int      uplo,
+           int      n,
+           float    alpha,
+           int64_t  x_ptr,
+           int      incx,
+           int64_t  y_ptr,
+           int      incy,
+           int64_t  arf_ptr)
+{
+    check_status(curfpSsfr2(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        &alpha,
+        reinterpret_cast<const float *>(x_ptr),
+        incx,
+        reinterpret_cast<const float *>(y_ptr),
+        incy,
+        reinterpret_cast<float *>(arf_ptr)));
+}
+
+/* =========================================================================
+ * ssfr2k: symmetric rank-2k update in RFP format
+ *
+ * C := alpha*op(A)*op(B)^T + alpha*op(B)*op(A)^T + beta*C
+ * A_ptr, B_ptr, C_ptr: raw device pointers (int64)
+ * =========================================================================*/
+void ssfr2k(Handle  &handle,
+            int      transr,
+            int      uplo,
+            int      trans,
+            int      n,
+            int      k,
+            float    alpha,
+            int64_t  A_ptr,
+            int      lda,
+            int64_t  B_ptr,
+            int      ldb,
+            float    beta,
+            int64_t  C_ptr)
+{
+    check_status(curfpSsfr2k(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        static_cast<curfpOperation_t>(trans),
+        n, k,
+        &alpha,
+        reinterpret_cast<const float *>(A_ptr), lda,
+        reinterpret_cast<const float *>(B_ptr), ldb,
+        &beta,
+        reinterpret_cast<float *>(C_ptr)));
+}
+
+/* =========================================================================
+ * ssfmm: symmetric matrix-matrix multiply in RFP format
+ *
+ * side=LEFT:  C := alpha * A * B + beta * C
+ * side=RIGHT: C := alpha * B * A + beta * C
+ * arf_ptr, B_ptr, C_ptr: raw device pointers (int64)
+ * =========================================================================*/
+void ssfmm(Handle  &handle,
+           int      transr,
+           int      uplo,
+           int      side,
+           int      m,
+           int      n,
+           float    alpha,
+           int64_t  arf_ptr,
+           int64_t  B_ptr,
+           int      ldb,
+           float    beta,
+           int64_t  C_ptr,
+           int      ldc)
+{
+    check_status(curfpSsfmm(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        static_cast<curfpSideMode_t>(side),
+        m, n,
+        &alpha,
+        reinterpret_cast<const float *>(arf_ptr),
+        reinterpret_cast<const float *>(B_ptr), ldb,
+        &beta,
+        reinterpret_cast<float *>(C_ptr), ldc));
+}
+
+/* =========================================================================
  * Module
  * =========================================================================*/
 PYBIND11_MODULE(_curfp_C, m)
@@ -343,11 +466,46 @@ PYBIND11_MODULE(_curfp_C, m)
           py::arg("arf_ptr"),
           py::arg("anorm"));
 
-    m.attr("OP_N")       = static_cast<int>(CURFP_OP_N);
-    m.attr("OP_T")       = static_cast<int>(CURFP_OP_T);
-    m.attr("FILL_LOWER") = static_cast<int>(CURFP_FILL_MODE_LOWER);
-    m.attr("FILL_UPPER") = static_cast<int>(CURFP_FILL_MODE_UPPER);
-    m.attr("NORM_MAX")   = static_cast<int>(CURFP_NORM_MAX);
-    m.attr("NORM_ONE")   = static_cast<int>(CURFP_NORM_ONE);
-    m.attr("NORM_FRO")   = static_cast<int>(CURFP_NORM_FRO);
+    m.def("ssfr", &ssfr,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("alpha"),  py::arg("x_ptr"), py::arg("incx"),
+          py::arg("arf_ptr"));
+
+    m.def("ssfr2", &ssfr2,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("alpha"),
+          py::arg("x_ptr"),  py::arg("incx"),
+          py::arg("y_ptr"),  py::arg("incy"),
+          py::arg("arf_ptr"));
+
+    m.def("ssfr2k", &ssfr2k,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"), py::arg("trans"),
+          py::arg("n"),      py::arg("k"),
+          py::arg("alpha"),
+          py::arg("A_ptr"),  py::arg("lda"),
+          py::arg("B_ptr"),  py::arg("ldb"),
+          py::arg("beta"),   py::arg("C_ptr"));
+
+    m.def("ssfmm", &ssfmm,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"), py::arg("side"),
+          py::arg("m"),      py::arg("n"),
+          py::arg("alpha"),  py::arg("arf_ptr"),
+          py::arg("B_ptr"),  py::arg("ldb"),
+          py::arg("beta"),   py::arg("C_ptr"), py::arg("ldc"));
+
+    m.attr("OP_N")        = static_cast<int>(CURFP_OP_N);
+    m.attr("OP_T")        = static_cast<int>(CURFP_OP_T);
+    m.attr("FILL_LOWER")  = static_cast<int>(CURFP_FILL_MODE_LOWER);
+    m.attr("FILL_UPPER")  = static_cast<int>(CURFP_FILL_MODE_UPPER);
+    m.attr("NORM_MAX")    = static_cast<int>(CURFP_NORM_MAX);
+    m.attr("NORM_ONE")    = static_cast<int>(CURFP_NORM_ONE);
+    m.attr("NORM_FRO")    = static_cast<int>(CURFP_NORM_FRO);
+    m.attr("SIDE_LEFT")   = static_cast<int>(CURFP_SIDE_LEFT);
+    m.attr("SIDE_RIGHT")  = static_cast<int>(CURFP_SIDE_RIGHT);
 }

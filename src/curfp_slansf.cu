@@ -10,12 +10,15 @@
  *   A = [[T1, S^T], [S, T2]]
  *
  * 1-norm:
- *   Accumulate absolute column sums from each block into a work vector of
- *   length n using atomicAdd, then take the max.
+ *   For each column j of the full n×n symmetric A, accumulate the absolute
+ *   column sum using a 2D block reduction: one CUDA block per column,
+ *   threads cooperatively reduce over all n rows via shared memory.
+ *   Then take the max over work[0..n-1].
  *
  * Frobenius norm:
  *   ||A||_F² = 2·||arf||² − ||diag(T1)||² − ||diag(T2)||²
- *   because each off-diagonal element appears once in arf but contributes
+ *   Uses cublasSnrm2 (not cublasSdot) to avoid float32 accumulation overflow
+ *   at large n.  Each off-diagonal element appears once in arf but contributes
  *   twice to ||A||_F² (A is symmetric, so A[i,j]=A[j,i]).
  *
  * Max-element norm:
@@ -26,6 +29,7 @@
 #include <climits>
 #include "curfp_internal.h"
 
+/* Threads per block for 1-norm reduction (must be power of 2) */
 static const int BLOCK = 256;
 
 /* -------------------------------------------------------------------------
@@ -90,112 +94,174 @@ static void get_slansf_params(int nisodd, int normaltransr, int lower,
     }
 }
 
-/* -------------------------------------------------------------------------
- * Kernels for 1-norm computation — column-parallel, no atomic operations.
+/* =========================================================================
+ * 1-norm: 2D block reduction kernels
  *
- * Strategy: one thread per column of each sub-block.  Each thread independently
- * accumulates the full column absolute sum (including the reflected symmetric
- * half) and writes to a unique work[] slot → zero atomic contention.
- * ------------------------------------------------------------------------- */
+ * Strategy: one CUDA block per output column of the full n×n symmetric A.
+ * Threads within the block cooperatively reduce over all n rows using
+ * shared memory, then thread 0 writes the column sum to work[col].
+ *
+ * This gives O(n/BLOCK) work per thread (vs O(n) in the old 1D kernels)
+ * and launches n blocks for full GPU occupancy.
+ *
+ * Two kernels:
+ *   k_colsum_sym  — handles T1 and T2 triangular sub-blocks (initialises work)
+ *   k_colsum_rect — adds S rectangular sub-block contributions (atomicAdd)
+ *
+ * The atomic in k_colsum_rect is fine: each column of work[] is written by
+ * exactly one k_colsum_sym block (which finishes first) and one
+ * k_colsum_rect block — only 2 writers total per slot.
+ * ========================================================================= */
 
 /*
- * k_colsums_sym: compute column absolute sums for both triangular sub-blocks T1 and T2.
+ * k_colsum_sym: column absolute sums for one triangular sub-block T.
  *
- * T1 (dim1×dim1, fill=upper1, lda=lda1, base offset off1 into arf):
- *   Column j (j<dim1): stored half (stride-1 down the column) + reflected half
- *   (stride-lda1 across rows, using A[r,j]=A[j,r] symmetry) → work[j]
+ * T is (dim × dim), col-major with leading dimension lda, base pointer
+ * arf+off.  fill_upper=1 means the upper triangle is stored.
  *
- * T2 (dim2×dim2, fill=upper2, lda=lda2, base offset off2 into arf):
- *   Same formula → work[dim1+j]
- *
- * No atomics: thread j writes exclusively to work[j] and work[dim1+j].
- * Initialises work[] directly; no prior memset required.
+ * Each block handles one column j (blockIdx.x).
+ * Threads stride over rows in steps of blockDim.x, summing |T[r,j]| for
+ * stored elements and |T[j,r]| for reflected elements (symmetric).
+ * Shared-memory tree reduction gives the final sum.
+ * Result written to work[col_global] where col_global = base + j.
  */
-static __global__ void k_colsums_sym(
+static __global__ void k_colsum_sym(
     const float * __restrict__ arf,
-    long off1, int dim1, int lda1, int upper1,
-    long off2, int dim2, int lda2, int upper2,
+    long off, int dim, int lda, int fill_upper,
+    int col_base,
     float * __restrict__ work)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    const float *T1 = arf + off1;
-    const float *T2 = arf + off2;
+    int j   = blockIdx.x;   /* column within this sub-block */
+    int tid = threadIdx.x;
+    if (j >= dim) return;
 
-    if (j < dim1) {
-        float s = 0.0f;
-        if (upper1) {
-            /* stored: rows 0..j at T1[j*lda1 + r]; reflected: rows j+1..dim1-1 */
-            for (int r = 0;   r <= j;   r++) s += fabsf(T1[(long)j*lda1 + r]);
-            for (int r = j+1; r < dim1; r++) s += fabsf(T1[(long)r*lda1 + j]);
-        } else {
-            /* stored: rows j..dim1-1 at T1[j*lda1 + r]; reflected: rows 0..j-1 */
-            for (int r = j;   r < dim1; r++) s += fabsf(T1[(long)j*lda1 + r]);
-            for (int r = 0;   r < j;    r++) s += fabsf(T1[(long)r*lda1 + j]);
+    extern __shared__ float sdata[];
+
+    const float *T = arf + off;
+    float s = 0.0f;
+
+    if (fill_upper) {
+        /* stored: rows 0..j (column j of upper triangular)
+         * reflected: rows j+1..dim-1 (read from row j of columns j+1..dim-1) */
+        for (int r = tid; r < dim; r += blockDim.x) {
+            float v;
+            if (r <= j)
+                v = T[(long)j * lda + r];   /* stored element */
+            else
+                v = T[(long)r * lda + j];   /* reflected: T[j,r] stored at col r */
+            s += fabsf(v);
         }
-        work[j] = s;
+    } else {
+        /* stored: rows j..dim-1 (column j of lower triangular)
+         * reflected: rows 0..j-1 */
+        for (int r = tid; r < dim; r += blockDim.x) {
+            float v;
+            if (r >= j)
+                v = T[(long)j * lda + r];   /* stored element */
+            else
+                v = T[(long)r * lda + j];   /* reflected */
+            s += fabsf(v);
+        }
     }
 
-    if (j < dim2) {
-        float s = 0.0f;
-        if (upper2) {
-            for (int r = 0;   r <= j;   r++) s += fabsf(T2[(long)j*lda2 + r]);
-            for (int r = j+1; r < dim2; r++) s += fabsf(T2[(long)r*lda2 + j]);
-        } else {
-            for (int r = j;   r < dim2; r++) s += fabsf(T2[(long)j*lda2 + r]);
-            for (int r = 0;   r < j;    r++) s += fabsf(T2[(long)r*lda2 + j]);
-        }
-        work[dim1 + j] = s;
+    sdata[tid] = s;
+    __syncthreads();
+
+    /* Standard power-of-2 tree reduction */
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride)
+            sdata[tid] += sdata[tid + stride];
+        __syncthreads();
     }
+
+    if (tid == 0)
+        work[col_base + j] = sdata[0];
 }
 
 /*
- * k_colsums_rect: accumulate S block contributions into work[] (no atomics).
+ * k_colsum_rect: add S rectangular sub-block contributions to work[].
  *
- * S is column-major, shape rows×cols, pointer = arf + s_off, lda = s_lda.
+ * S is column-major, shape (rows × cols), pointer arf+s_off, lda=s_lda.
+ * is_a21=1: S = A[dim1:n, 0:dim1]  (rows=dim2, cols=dim1)
+ *   col j < dim1: sum of |S[r,j]| for r=0..dim2-1 → atomicAdd(work[j], sum)
+ *   row j < dim2: sum of |S[j,c]| for c=0..dim1-1 → atomicAdd(work[dim1+j], sum)
+ * is_a21=0: S = A[0:dim1, dim1:n]  (rows=dim1, cols=dim2)
+ *   row j < dim1: → atomicAdd(work[j], sum)
+ *   col j < dim2: → atomicAdd(work[dim1+j], sum)
  *
- * is_a21=1: S = A[dim1:n, 0:dim1]  (dim2 rows × dim1 cols)
- *   col j of S (j<dim1) → sum over rows → work[j]      += col_sum
- *   row j of S (j<dim2) → sum over cols → work[dim1+j] += row_sum
- *
- * is_a21=0: S = A[0:dim1, dim1:n]  (dim1 rows × dim2 cols)
- *   row j of S (j<dim1) → sum over cols → work[j]      += row_sum
- *   col j of S (j<dim2) → sum over rows → work[dim1+j] += col_sum
- *
- * No atomics: for any j, the two writes go to work[j] and work[dim1+j] —
- * these slots are disjoint across threads and disjoint from each other.
- * Must run after k_colsums_sym (which initialises work[]).
+ * One block per column-of-interest; threads stride over the other dimension.
  */
-static __global__ void k_colsums_rect(
+static __global__ void k_colsum_rect(
     const float * __restrict__ S,
     int rows, int cols, int lda,
     int is_a21, int dim1,
     float * __restrict__ work)
 {
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    int j   = blockIdx.x;
+    int tid = threadIdx.x;
+
+    extern __shared__ float sdata[];
+
+    float s = 0.0f;
 
     if (is_a21) {
-        /* col j (j<cols=dim1) → work[j];  row j (j<rows=dim2) → work[dim1+j] */
+        /* Two roles for j: as a column index (j<cols=dim1) and as a row index (j<rows=dim2).
+         * Launch with gridDim.x = max(cols, rows); each block handles both roles. */
         if (j < cols) {
-            float s = 0.0f;
-            for (int r = 0; r < rows; r++) s += fabsf(S[(long)j*lda + r]);
-            work[j] += s;
+            /* column j of S → work[j] */
+            for (int r = tid; r < rows; r += blockDim.x)
+                s += fabsf(S[(long)j * lda + r]);
+            sdata[tid] = s;
+            __syncthreads();
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) sdata[tid] += sdata[tid + stride];
+                __syncthreads();
+            }
+            if (tid == 0) atomicAdd(&work[j], sdata[0]);
+            __syncthreads();
         }
+
+        s = 0.0f;
         if (j < rows) {
-            float s = 0.0f;
-            for (int c = 0; c < cols; c++) s += fabsf(S[(long)c*lda + j]);
-            work[dim1 + j] += s;
+            /* row j of S → work[dim1+j] */
+            for (int c = tid; c < cols; c += blockDim.x)
+                s += fabsf(S[(long)c * lda + j]);
+            sdata[tid] = s;
+            __syncthreads();
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) sdata[tid] += sdata[tid + stride];
+                __syncthreads();
+            }
+            if (tid == 0) atomicAdd(&work[dim1 + j], sdata[0]);
         }
     } else {
-        /* row j (j<rows=dim1) → work[j];  col j (j<cols=dim2) → work[dim1+j] */
+        /* is_a21=0: S = A[0:dim1, dim1:n], rows=dim1, cols=dim2 */
         if (j < rows) {
-            float s = 0.0f;
-            for (int c = 0; c < cols; c++) s += fabsf(S[(long)c*lda + j]);
-            work[j] += s;
+            /* row j of S → work[j] */
+            for (int c = tid; c < cols; c += blockDim.x)
+                s += fabsf(S[(long)c * lda + j]);
+            sdata[tid] = s;
+            __syncthreads();
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) sdata[tid] += sdata[tid + stride];
+                __syncthreads();
+            }
+            if (tid == 0) atomicAdd(&work[j], sdata[0]);
+            __syncthreads();
         }
+
+        s = 0.0f;
         if (j < cols) {
-            float s = 0.0f;
-            for (int r = 0; r < rows; r++) s += fabsf(S[(long)j*lda + r]);
-            work[dim1 + j] += s;
+            /* column j of S → work[dim1+j] */
+            for (int r = tid; r < rows; r += blockDim.x)
+                s += fabsf(S[(long)j * lda + r]);
+            sdata[tid] = s;
+            __syncthreads();
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) sdata[tid] += sdata[tid + stride];
+                __syncthreads();
+            }
+            if (tid == 0) atomicAdd(&work[dim1 + j], sdata[0]);
         }
     }
 }
@@ -231,7 +297,7 @@ curfpStatus_t curfpSlansf(curfpHandle_t    handle,
     curfpStatus_t status = CURFP_STATUS_SUCCESS;
     float        *d_work = NULL;
     /* n*(n+1)/2 — use long long to avoid int overflow for large n.
-     * cublasSdot / cublasIsamax take int n, so cap at INT_MAX; -1 means "too large". */
+     * cublasSnrm2 / cublasIsamax take int n, so cap at INT_MAX; -1 means "too large". */
     long long nt_ll = (long long)n * (n + 1) / 2;
     int       nt    = (nt_ll <= INT_MAX) ? (int)nt_ll : -1;
 
@@ -271,31 +337,48 @@ curfpStatus_t curfpSlansf(curfpHandle_t    handle,
         int idx = 0;
         CHK_CB(cublasIsamax(cb, nt, arf, 1, &idx));
         float val = 0.0f;
-        CHK_CU(cudaMemcpy(&val, arf + (idx - 1), sizeof(float),
-                          cudaMemcpyDeviceToHost));
+        CHK_CU(cudaMemcpyAsync(&val, arf + (idx - 1), sizeof(float),
+                               cudaMemcpyDeviceToHost, stream));
+        CHK_CU(cudaStreamSynchronize(stream));
         *result = fabsf(val);
 
     } else if (norm == CURFP_NORM_ONE) {
-        /* max column absolute sum — column-parallel kernels, no atomic operations.
-         * k_colsums_sym  writes  work[0..n-1] (initialises; no memset needed).
-         * k_colsums_rect adds S contributions; must run after k_colsums_sym. */
+        /*
+         * max column absolute sum.
+         *
+         * k_colsum_sym (one block per column): initialises work[0..n-1] with
+         *   the T1 and T2 triangular column sums (including symmetric reflection).
+         * k_colsum_rect (one block per max(dim1,dim2)): adds S contributions
+         *   via atomicAdd.
+         *
+         * Final max via cublasIsamax on work[0..n-1].
+         */
         CHK_CU(cudaMallocAsync((void **)&d_work, (size_t)n * sizeof(float), stream));
 
-        int grid1 = (max(p.dim1, p.dim2) + BLOCK - 1) / BLOCK;
+        size_t smem = BLOCK * sizeof(float);
         int upper1 = (p.fill1 == CUBLAS_FILL_MODE_UPPER) ? 1 : 0;
         int upper2 = (p.fill2 == CUBLAS_FILL_MODE_UPPER) ? 1 : 0;
-        k_colsums_sym<<<grid1, BLOCK, 0, stream>>>(
-            arf, p.off1, p.dim1, p.lda1, upper1,
-                 p.off2, p.dim2, p.lda2, upper2,
-            d_work);
-        CHK_CU(cudaGetLastError());
 
+        /* T1: blocks 0..dim1-1, writing work[0..dim1-1] */
+        if (p.dim1 > 0) {
+            k_colsum_sym<<<p.dim1, BLOCK, smem, stream>>>(
+                arf, p.off1, p.dim1, p.lda1, upper1, 0, d_work);
+            CHK_CU(cudaGetLastError());
+        }
+        /* T2: blocks 0..dim2-1, writing work[dim1..n-1] */
+        if (p.dim2 > 0) {
+            k_colsum_sym<<<p.dim2, BLOCK, smem, stream>>>(
+                arf, p.off2, p.dim2, p.lda2, upper2, p.dim1, d_work);
+            CHK_CU(cudaGetLastError());
+        }
+
+        /* S block: add contributions via atomicAdd */
         if (p.dim1 > 0 && p.dim2 > 0) {
             int is_a21 = (p.s_op1 == CUBLAS_OP_T) ? 1 : 0;
             int rows   = is_a21 ? p.dim2 : p.dim1;
             int cols   = is_a21 ? p.dim1 : p.dim2;
-            int grid2  = (max(rows, cols) + BLOCK - 1) / BLOCK;
-            k_colsums_rect<<<grid2, BLOCK, 0, stream>>>(
+            int grid   = max(rows, cols);
+            k_colsum_rect<<<grid, BLOCK, smem, stream>>>(
                 arf + p.s_off, rows, cols, p.s_lda, is_a21, p.dim1, d_work);
             CHK_CU(cudaGetLastError());
         }
@@ -303,30 +386,39 @@ curfpStatus_t curfpSlansf(curfpHandle_t    handle,
         int idx = 0;
         CHK_CB(cublasIsamax(cb, n, d_work, 1, &idx));
         float val = 0.0f;
-        CHK_CU(cudaMemcpy(&val, d_work + (idx - 1), sizeof(float),
-                          cudaMemcpyDeviceToHost));
+        CHK_CU(cudaMemcpyAsync(&val, d_work + (idx - 1), sizeof(float),
+                               cudaMemcpyDeviceToHost, stream));
+        CHK_CU(cudaStreamSynchronize(stream));
         *result = val;   /* already non-negative (fabsf-based column sums) */
 
     } else if (norm == CURFP_NORM_FRO) {
         /*
          * ||A||_F = sqrt(2·||arf||² − ||diag(T1)||² − ||diag(T2)||²)
          *
-         * Derivation: each off-diagonal stored element contributes ×2 to ||A||_F²
-         * (once from A[i,j], once from A[j,i]).  So:
-         *   ||A||_F² = 2·||arf||² − diag_sq(T1) − diag_sq(T2)
+         * Uses cublasSnrm2 (not cublasSdot) to avoid float32 catastrophic
+         * accumulation at large n.  cublasSdot on n*(n+1)/2 ~ 500M float32
+         * elements loses all precision; cublasSnrm2 uses a stable algorithm.
          */
         if (nt < 0) { status = CURFP_STATUS_INVALID_VALUE; goto cleanup; }
-        float arf_sq   = 0.0f;
-        float diag1_sq = 0.0f;
-        float diag2_sq = 0.0f;
-        CHK_CB(cublasSdot(cb, nt, arf, 1, arf, 1, &arf_sq));
+
+        float arf_nrm  = 0.0f;
+        float diag1_nrm = 0.0f;
+        float diag2_nrm = 0.0f;
+
+        /* ||arf|| via stable cublasSnrm2 */
+        CHK_CB(cublasSnrm2(cb, nt, arf, 1, &arf_nrm));
+
+        /* ||diag(T1)|| — stride lda1+1 picks the diagonal elements */
         if (p.dim1 > 0)
-            CHK_CB(cublasSdot(cb, p.dim1, arf + p.off1, p.lda1 + 1,
-                              arf + p.off1, p.lda1 + 1, &diag1_sq));
+            CHK_CB(cublasSnrm2(cb, p.dim1, arf + p.off1, p.lda1 + 1, &diag1_nrm));
+
+        /* ||diag(T2)|| — stride lda2+1 picks the diagonal elements */
         if (p.dim2 > 0)
-            CHK_CB(cublasSdot(cb, p.dim2, arf + p.off2, p.lda2 + 1,
-                              arf + p.off2, p.lda2 + 1, &diag2_sq));
-        float fro_sq = 2.0f * arf_sq - diag1_sq - diag2_sq;
+            CHK_CB(cublasSnrm2(cb, p.dim2, arf + p.off2, p.lda2 + 1, &diag2_nrm));
+
+        float fro_sq = 2.0f * arf_nrm  * arf_nrm
+                     -        diag1_nrm * diag1_nrm
+                     -        diag2_nrm * diag2_nrm;
         *result = (fro_sq > 0.0f) ? sqrtf(fro_sq) : 0.0f;
 
     } else {
