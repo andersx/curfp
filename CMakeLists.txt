@@ -6,6 +6,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 14)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+# sm_60 is the minimum that supports native double-precision atomicAdd.
+# Override only if the caller has not already set CMAKE_CUDA_ARCHITECTURES.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 60)
+endif()
+
 find_package(CUDAToolkit REQUIRED)
 
 # ---------------------------------------------------------------------------
@@ -26,6 +32,20 @@ add_library(curfp SHARED
     src/curfp_slansf.cu
     src/curfp_strttf.cu
     src/curfp_stfttr.cu
+    # Double-precision variants
+    src/curfp_dssfrk.cpp
+    src/curfp_dsfr.cpp
+    src/curfp_dsfr2.cpp
+    src/curfp_dsfr2k.cpp
+    src/curfp_dsfmm.cpp
+    src/curfp_dpftrf.cpp
+    src/curfp_dpftrs.cpp
+    src/curfp_dpftri.cu
+    src/curfp_dsfmv.cpp
+    src/curfp_dpfcon.cu
+    src/curfp_dlansf.cu
+    src/curfp_dstrttf.cu
+    src/curfp_dstfttr.cu
 )
 
 target_include_directories(curfp

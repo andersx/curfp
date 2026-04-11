@@ -63,6 +63,20 @@ from ._curfp_C import (
     ssfr2 as _ssfr2_C,
     ssfr2k as _ssfr2k_C,
     ssfmm as _ssfmm_C,
+    # Double-precision bindings
+    dsfrk as _dsfrk_C,
+    dpftrf as _dpftrf_C,
+    dpftrs as _dpftrs_C,
+    dpftri as _dpftri_C,
+    dsfmv as _dsfmv_C,
+    dstrttf as _dstrttf_C,
+    dstfttr as _dstfttr_C,
+    dlansf as _dlansf_C,
+    dpfcon as _dpfcon_C,
+    dsfr as _dsfr_C,
+    dsfr2 as _dsfr2_C,
+    dsfr2k as _dsfr2k_C,
+    dsfmm as _dsfmm_C,
 )
 
 import math
@@ -165,6 +179,15 @@ def _validate(t: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must be float32 (got {t.dtype})")
 
 
+def _validate64(t: torch.Tensor, name: str) -> None:
+    if not t.is_cuda:
+        raise ValueError(f"{name} must be a CUDA tensor")
+    if not t.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if t.dtype != torch.float64:
+        raise ValueError(f"{name} must be float64 (got {t.dtype})")
+
+
 # ---------------------------------------------------------------------------
 # RFP diagonal utilities
 # ---------------------------------------------------------------------------
@@ -255,13 +278,18 @@ def add_to_diagonal(
     and is useful for regularizing before Cholesky factorization.
 
     Args:
-        C:      RFP-packed float32 CUDA tensor of size n*(n+1)//2.
+        C:      RFP-packed float32 or float64 CUDA tensor of size n*(n+1)//2.
         value:  Scalar to add to each diagonal element.
         transr: RFP storage variant, 'N' or 'T' (default 'T').
         uplo:   Triangle stored, 'L' or 'U' (default 'U').
         n:      Matrix order (inferred from C.numel() if not given).
     """
-    _validate(C, "C")
+    if not C.is_cuda:
+        raise ValueError("C must be a CUDA tensor")
+    if not C.is_contiguous():
+        raise ValueError("C must be contiguous")
+    if C.dtype not in (torch.float32, torch.float64):
+        raise ValueError(f"C must be float32 or float64 (got {C.dtype})")
     if n is None:
         n = _n_from_rfp(C.numel())
     idx = rfp_diag_indices(n, transr=transr, uplo=uplo, device=C.device)
@@ -1308,11 +1336,758 @@ def ssfmm_raw(
     )
 
 
+# ===========================================================================
+# Double-precision (D-prefix) API
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# dstrttf / dstfttr — double RFP ↔ full triangular format conversion
+# ---------------------------------------------------------------------------
+def dstrttf(
+    A: torch.Tensor,
+    *,
+    transr: str = "T",
+    uplo: str = "U",
+    n: int = None,
+) -> torch.Tensor:
+    """Convert a full triangular double matrix to RFP packed format.
+
+    Args:
+        A:      float64 contiguous CUDA tensor of shape (n, n).
+        transr: RFP storage variant, 'N' or 'T' (default 'T').
+        uplo:   Triangle to read from A, 'L' or 'U' (default 'U').
+        n:      Matrix order (inferred from A.shape[0] if not given).
+
+    Returns:
+        1-D float64 CUDA tensor of size n*(n+1)//2 in RFP format.
+    """
+    _validate64(A, "A")
+    if A.ndim != 2 or A.shape[0] != A.shape[1]:
+        raise ValueError(f"A must be a square 2-D tensor, got shape {A.shape}")
+    if n is None:
+        n = A.shape[0]
+    nt = n * (n + 1) // 2
+    arf = torch.empty(nt, dtype=torch.float64, device=A.device)
+    _dstrttf_C(
+        _get_handle(), _op(transr), _fill(uplo), n, A.data_ptr(), n, arf.data_ptr()
+    )
+    return arf
+
+
+def dstfttr(
+    arf: torch.Tensor,
+    *,
+    transr: str = "T",
+    uplo: str = "U",
+    n: int = None,
+) -> torch.Tensor:
+    """Convert an RFP packed double tensor to a full triangular matrix.
+
+    Args:
+        arf:    float64 contiguous CUDA tensor of size n*(n+1)//2 (RFP format).
+        transr: RFP storage variant, 'N' or 'T' (default 'T').
+        uplo:   Triangle to write in the output, 'L' or 'U' (default 'U').
+        n:      Matrix order (inferred from arf.numel() if not given).
+
+    Returns:
+        float64 CUDA tensor of shape (n, n) with one triangle filled.
+    """
+    _validate64(arf, "arf")
+    if n is None:
+        n = _n_from_rfp(arf.numel())
+    A = torch.zeros(n, n, dtype=torch.float64, device=arf.device)
+    _dstfttr_C(
+        _get_handle(), _op(transr), _fill(uplo), n, arf.data_ptr(), A.data_ptr(), n
+    )
+    return A
+
+
+def dstrttf_raw(
+    handle: Handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    A: torch.Tensor,
+    lda: int,
+    arf: torch.Tensor,
+) -> None:
+    """Low-level full triangular → double RFP format conversion."""
+    _validate64(A, "A")
+    _validate64(arf, "arf")
+    _dstrttf_C(handle, transr, uplo, n, A.data_ptr(), lda, arf.data_ptr())
+
+
+def dstfttr_raw(
+    handle: Handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    arf: torch.Tensor,
+    A: torch.Tensor,
+    lda: int,
+) -> None:
+    """Low-level double RFP format → full triangular conversion."""
+    _validate64(arf, "arf")
+    _validate64(A, "A")
+    _dstfttr_C(handle, transr, uplo, n, arf.data_ptr(), A.data_ptr(), lda)
+
+
+# ---------------------------------------------------------------------------
+# dsfrk — double symmetric rank-k update
+# ---------------------------------------------------------------------------
+def dsfrk(
+    A: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    transr: str = "T",
+    uplo: str = "U",
+    trans: str = "T",
+    n: int = None,
+    k: int = None,
+    lda: int = None,
+) -> None:
+    """Double-precision symmetric rank-k update into RFP-packed storage."""
+    _validate64(A, "A")
+    _validate64(C, "C")
+    if n is None:
+        n = _n_from_rfp(C.numel())
+    trans_upper = trans.upper()
+    if k is None:
+        k = A.shape[1] if trans_upper == "T" else A.shape[0]
+    if lda is None:
+        lda = A.shape[1] if trans_upper == "T" else A.shape[0]
+    _dsfrk_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        _op(trans),
+        n,
+        k,
+        float(alpha),
+        A.data_ptr(),
+        lda,
+        float(beta),
+        C.data_ptr(),
+    )
+
+
+def dsfrk_raw(
+    handle: Handle,
+    transr: int,
+    uplo: int,
+    trans: int,
+    n: int,
+    k: int,
+    alpha: float,
+    A: torch.Tensor,
+    lda: int,
+    beta: float,
+    C: torch.Tensor,
+) -> None:
+    """Low-level dsfrk."""
+    _validate64(A, "A")
+    _validate64(C, "C")
+    _dsfrk_C(
+        handle,
+        transr,
+        uplo,
+        trans,
+        n,
+        k,
+        float(alpha),
+        A.data_ptr(),
+        lda,
+        float(beta),
+        C.data_ptr(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# dpftrf — double Cholesky factorization
+# ---------------------------------------------------------------------------
+def dpftrf(
+    C: torch.Tensor,
+    *,
+    n: int = None,
+    transr: str = "T",
+    uplo: str = "U",
+    check: bool = True,
+) -> int:
+    """Double-precision in-place Cholesky factorization of RFP-packed matrix."""
+    _validate64(C, "C")
+    if n is None:
+        n = _n_from_rfp(C.numel())
+    info = _dpftrf_C(_get_handle(), _op(transr), _fill(uplo), n, C.data_ptr())
+    if check and info != 0:
+        raise torch.linalg.LinAlgError(
+            f"dpftrf: matrix is not positive definite "
+            f"(leading minor of order {info} is not positive definite)"
+        )
+    return info
+
+
+def dpftrf_raw(
+    handle: Handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    A: torch.Tensor,
+) -> int:
+    """Low-level dpftrf."""
+    _validate64(A, "A")
+    return _dpftrf_C(handle, transr, uplo, n, A.data_ptr())
+
+
+# ---------------------------------------------------------------------------
+# dpftrs — double triangular solve
+# ---------------------------------------------------------------------------
+def dpftrs(
+    C: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    n: int = None,
+    nrhs: int = None,
+    transr: str = "T",
+    uplo: str = "U",
+) -> None:
+    """Solve A * X = B using the double RFP Cholesky factor from ``dpftrf``."""
+    _validate64(C, "C")
+    _validate64(B, "B")
+    if n is None:
+        n = _n_from_rfp(C.numel())
+    squeezed = B.ndim == 1
+    if squeezed:
+        B = B.unsqueeze(1)
+    if nrhs is None:
+        nrhs = B.shape[1]
+    if B.shape[0] != n:
+        raise ValueError(f"B has {B.shape[0]} rows but n={n}")
+    B_f = B.t().contiguous()
+    _dpftrs_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        n,
+        nrhs,
+        C.data_ptr(),
+        B_f.data_ptr(),
+        n,
+    )
+    B.copy_(B_f.t())
+    if squeezed:
+        B.squeeze_(1)
+
+
+def dpftrs_raw(
+    handle: Handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    nrhs: int,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    ldb: int,
+) -> None:
+    """Low-level dpftrs."""
+    _validate64(A, "A")
+    _validate64(B, "B")
+    _dpftrs_C(handle, transr, uplo, n, nrhs, A.data_ptr(), B.data_ptr(), ldb)
+
+
+# ---------------------------------------------------------------------------
+# dpftri — double SPD matrix inversion
+# ---------------------------------------------------------------------------
+def dpftri(
+    C: torch.Tensor,
+    *,
+    n: int = None,
+    transr: str = "T",
+    uplo: str = "U",
+) -> None:
+    """Compute A^{-1} in-place from the double RFP Cholesky factor."""
+    _validate64(C, "C")
+    if n is None:
+        n = _n_from_rfp(C.numel())
+    _dpftri_C(_get_handle(), _op(transr), _fill(uplo), n, C.data_ptr())
+
+
+def dpftri_raw(
+    handle: Handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    A: torch.Tensor,
+) -> None:
+    """Low-level dpftri."""
+    _validate64(A, "A")
+    _dpftri_C(handle, transr, uplo, n, A.data_ptr())
+
+
+# ---------------------------------------------------------------------------
+# dsfmv — double symmetric matrix-vector multiply
+# ---------------------------------------------------------------------------
+def dsfmv(
+    arf: torch.Tensor,
+    x: torch.Tensor,
+    y: torch.Tensor = None,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    transr: str = "T",
+    uplo: str = "U",
+    n: int = None,
+) -> torch.Tensor:
+    """Double-precision symmetric matrix-vector multiply: y := alpha*A*x + beta*y."""
+    _validate64(arf, "arf")
+    _validate64(x, "x")
+    if n is None:
+        n = _n_from_rfp(arf.numel())
+    if y is None:
+        y = torch.zeros(n, dtype=torch.float64, device=arf.device)
+    _validate64(y, "y")
+    if x.numel() != n:
+        raise ValueError(f"x has {x.numel()} elements but n={n}")
+    if y.numel() != n:
+        raise ValueError(f"y has {y.numel()} elements but n={n}")
+    _dsfmv_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        n,
+        float(alpha),
+        arf.data_ptr(),
+        x.data_ptr(),
+        1,
+        float(beta),
+        y.data_ptr(),
+        1,
+    )
+    return y
+
+
+def dsfmv_raw(
+    handle: Handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    alpha: float,
+    arf: torch.Tensor,
+    x: torch.Tensor,
+    incx: int,
+    beta: float,
+    y: torch.Tensor,
+    incy: int,
+) -> None:
+    """Low-level dsfmv."""
+    _validate64(arf, "arf")
+    _validate64(x, "x")
+    _validate64(y, "y")
+    _dsfmv_C(
+        handle,
+        transr,
+        uplo,
+        n,
+        float(alpha),
+        arf.data_ptr(),
+        x.data_ptr(),
+        incx,
+        float(beta),
+        y.data_ptr(),
+        incy,
+    )
+
+
+# ---------------------------------------------------------------------------
+# dlansf — double matrix norm in RFP format
+# ---------------------------------------------------------------------------
+def dlansf(
+    C: torch.Tensor,
+    norm: str = "1",
+    *,
+    transr: str = "T",
+    uplo: str = "U",
+    n: int = None,
+) -> float:
+    """Compute a norm of a double symmetric matrix stored in RFP format."""
+    _validate64(C, "C")
+    if n is None:
+        n = _n_from_rfp(C.numel())
+    return float(
+        _dlansf_C(_get_handle(), _norm(norm), _op(transr), _fill(uplo), n, C.data_ptr())
+    )
+
+
+def dlansf_raw(
+    handle: Handle,
+    norm: int,
+    transr: int,
+    uplo: int,
+    n: int,
+    C: torch.Tensor,
+) -> float:
+    """Low-level dlansf."""
+    _validate64(C, "C")
+    return float(_dlansf_C(handle, norm, transr, uplo, n, C.data_ptr()))
+
+
+# ---------------------------------------------------------------------------
+# dpfcon — double reciprocal condition number estimator
+# ---------------------------------------------------------------------------
+def dpfcon(
+    C: torch.Tensor,
+    anorm: float,
+    *,
+    transr: str = "T",
+    uplo: str = "U",
+    n: int = None,
+) -> float:
+    """Estimate the reciprocal condition number from a double RFP Cholesky factor."""
+    _validate64(C, "C")
+    if n is None:
+        n = _n_from_rfp(C.numel())
+    return float(
+        _dpfcon_C(
+            _get_handle(), _op(transr), _fill(uplo), n, C.data_ptr(), float(anorm)
+        )
+    )
+
+
+def dpfcon_raw(
+    handle: Handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    C: torch.Tensor,
+    anorm: float,
+) -> float:
+    """Low-level dpfcon."""
+    _validate64(C, "C")
+    return float(_dpfcon_C(handle, transr, uplo, n, C.data_ptr(), float(anorm)))
+
+
+def dpftrf_rcond(
+    C: torch.Tensor,
+    *,
+    transr: str = "T",
+    uplo: str = "U",
+    n: int = None,
+    check: bool = True,
+) -> float:
+    """Double-precision Cholesky + condition number estimate (dlansf+dpftrf+dpfcon)."""
+    _validate64(C, "C")
+    if n is None:
+        n = _n_from_rfp(C.numel())
+    anorm = float(
+        _dlansf_C(_get_handle(), NORM_ONE, _op(transr), _fill(uplo), n, C.data_ptr())
+    )
+    info = _dpftrf_C(_get_handle(), _op(transr), _fill(uplo), n, C.data_ptr())
+    if check and info != 0:
+        raise torch.linalg.LinAlgError(
+            f"dpftrf_rcond: matrix is not positive definite "
+            f"(leading minor of order {info} is not positive definite)"
+        )
+    if info != 0 or anorm == 0.0:
+        return 0.0
+    return float(
+        _dpfcon_C(_get_handle(), _op(transr), _fill(uplo), n, C.data_ptr(), anorm)
+    )
+
+
+# ---------------------------------------------------------------------------
+# dsfr — double symmetric rank-1 update
+# ---------------------------------------------------------------------------
+def dsfr(
+    arf: torch.Tensor,
+    x: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    transr: str = "T",
+    uplo: str = "U",
+    n: int = None,
+) -> None:
+    """Double-precision in-place symmetric rank-1 update: arf := alpha*x*x^T + arf."""
+    _validate64(arf, "arf")
+    _validate64(x, "x")
+    if n is None:
+        n = _n_from_rfp(arf.numel())
+    if x.numel() != n:
+        raise ValueError(f"x must have {n} elements, got {x.numel()}")
+    _dsfr_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        n,
+        float(alpha),
+        x.data_ptr(),
+        1,
+        arf.data_ptr(),
+    )
+
+
+def dsfr_raw(
+    handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    alpha: float,
+    x: torch.Tensor,
+    incx: int,
+    arf: torch.Tensor,
+) -> None:
+    """Low-level dsfr."""
+    _validate64(x, "x")
+    _validate64(arf, "arf")
+    _dsfr_C(handle, transr, uplo, n, float(alpha), x.data_ptr(), incx, arf.data_ptr())
+
+
+# ---------------------------------------------------------------------------
+# dsfr2 — double symmetric rank-2 update
+# ---------------------------------------------------------------------------
+def dsfr2(
+    arf: torch.Tensor,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    transr: str = "T",
+    uplo: str = "U",
+    n: int = None,
+) -> None:
+    """Double-precision in-place symmetric rank-2 update."""
+    _validate64(arf, "arf")
+    _validate64(x, "x")
+    _validate64(y, "y")
+    if n is None:
+        n = _n_from_rfp(arf.numel())
+    if x.numel() != n:
+        raise ValueError(f"x must have {n} elements, got {x.numel()}")
+    if y.numel() != n:
+        raise ValueError(f"y must have {n} elements, got {y.numel()}")
+    _dsfr2_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        n,
+        float(alpha),
+        x.data_ptr(),
+        1,
+        y.data_ptr(),
+        1,
+        arf.data_ptr(),
+    )
+
+
+def dsfr2_raw(
+    handle,
+    transr: int,
+    uplo: int,
+    n: int,
+    alpha: float,
+    x: torch.Tensor,
+    incx: int,
+    y: torch.Tensor,
+    incy: int,
+    arf: torch.Tensor,
+) -> None:
+    """Low-level dsfr2."""
+    _validate64(x, "x")
+    _validate64(y, "y")
+    _validate64(arf, "arf")
+    _dsfr2_C(
+        handle,
+        transr,
+        uplo,
+        n,
+        float(alpha),
+        x.data_ptr(),
+        incx,
+        y.data_ptr(),
+        incy,
+        arf.data_ptr(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# dsfr2k — double symmetric rank-2k update
+# ---------------------------------------------------------------------------
+def dsfr2k(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    transr: str = "T",
+    uplo: str = "U",
+    trans: str = "T",
+    n: int = None,
+    k: int = None,
+    lda: int = None,
+    ldb: int = None,
+) -> None:
+    """Double-precision in-place symmetric rank-2k update."""
+    _validate64(A, "A")
+    _validate64(B, "B")
+    _validate64(C, "C")
+    if n is None:
+        n = _n_from_rfp(C.numel())
+    trans_upper = trans.upper()
+    if k is None:
+        k = A.shape[1] if trans_upper == "T" else A.shape[0]
+    if lda is None:
+        lda = A.shape[1] if trans_upper == "T" else A.shape[0]
+    if ldb is None:
+        ldb = B.shape[1] if trans_upper == "T" else B.shape[0]
+    _dsfr2k_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        _op(trans),
+        n,
+        k,
+        float(alpha),
+        A.data_ptr(),
+        lda,
+        B.data_ptr(),
+        ldb,
+        float(beta),
+        C.data_ptr(),
+    )
+
+
+def dsfr2k_raw(
+    handle,
+    transr: int,
+    uplo: int,
+    trans: int,
+    n: int,
+    k: int,
+    alpha: float,
+    A: torch.Tensor,
+    lda: int,
+    B: torch.Tensor,
+    ldb: int,
+    beta: float,
+    C: torch.Tensor,
+) -> None:
+    """Low-level dsfr2k."""
+    _validate64(A, "A")
+    _validate64(B, "B")
+    _validate64(C, "C")
+    _dsfr2k_C(
+        handle,
+        transr,
+        uplo,
+        trans,
+        n,
+        k,
+        float(alpha),
+        A.data_ptr(),
+        lda,
+        B.data_ptr(),
+        ldb,
+        float(beta),
+        C.data_ptr(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# dsfmm — double symmetric matrix-matrix multiply
+# ---------------------------------------------------------------------------
+def dsfmm(
+    arf: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor = None,
+    *,
+    alpha: float = 1.0,
+    beta: float = 0.0,
+    transr: str = "T",
+    uplo: str = "U",
+    side: str = "L",
+    n_A: int = None,
+) -> torch.Tensor:
+    """Double-precision symmetric matrix-matrix multiply using RFP format matrix A."""
+    _validate64(arf, "arf")
+    _validate64(B, "B")
+    if B.ndim != 2:
+        raise ValueError(f"B must be a 2-D tensor, got shape {B.shape}")
+    m, n = B.shape[0], B.shape[1]
+    if n_A is None:
+        n_A = _n_from_rfp(arf.numel())
+    side_upper = side.upper()
+    if side_upper == "L" and n_A != m:
+        raise ValueError(f"side='L': A is {n_A}×{n_A} but B has {m} rows")
+    if side_upper == "R" and n_A != n:
+        raise ValueError(f"side='R': A is {n_A}×{n_A} but B has {n} cols")
+    if C is None:
+        C = torch.zeros(m, n, dtype=torch.float64, device=arf.device)
+    _validate64(C, "C")
+    if C.shape != (m, n):
+        raise ValueError(f"C must be {m}×{n}, got {C.shape}")
+    ldb = m
+    ldc = m
+    _dsfmm_C(
+        _get_handle(),
+        _op(transr),
+        _fill(uplo),
+        _side(side),
+        m,
+        n,
+        float(alpha),
+        arf.data_ptr(),
+        B.data_ptr(),
+        ldb,
+        float(beta),
+        C.data_ptr(),
+        ldc,
+    )
+    return C
+
+
+def dsfmm_raw(
+    handle,
+    transr: int,
+    uplo: int,
+    side: int,
+    m: int,
+    n: int,
+    alpha: float,
+    arf: torch.Tensor,
+    B: torch.Tensor,
+    ldb: int,
+    beta: float,
+    C: torch.Tensor,
+    ldc: int,
+) -> None:
+    """Low-level dsfmm."""
+    _validate64(arf, "arf")
+    _validate64(B, "B")
+    _validate64(C, "C")
+    _dsfmm_C(
+        handle,
+        transr,
+        uplo,
+        side,
+        m,
+        n,
+        float(alpha),
+        arf.data_ptr(),
+        B.data_ptr(),
+        ldb,
+        float(beta),
+        C.data_ptr(),
+        ldc,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 __all__ = [
-    # High-level API
+    # High-level API — single precision
     "ssfrk",
     "ssfr",
     "ssfr2",
@@ -1325,15 +2100,31 @@ __all__ = [
     "slansf",
     "spfcon",
     "spftrf_rcond",
+    # High-level API — double precision
+    "dsfrk",
+    "dsfr",
+    "dsfr2",
+    "dsfr2k",
+    "dsfmm",
+    "dpftrf",
+    "dpftrs",
+    "dpftri",
+    "dsfmv",
+    "dlansf",
+    "dpfcon",
+    "dpftrf_rcond",
     # Diagonal utilities
     "rfp_diag_indices",
     "add_to_diagonal",
     # Stream control
     "set_stream",
-    # Format conversion
+    # Format conversion — single precision
     "strttf",
     "stfttr",
-    # Low-level / power-user API
+    # Format conversion — double precision
+    "dstrttf",
+    "dstfttr",
+    # Low-level / power-user API — single precision
     "ssfrk_raw",
     "ssfr_raw",
     "ssfr2_raw",
@@ -1347,6 +2138,20 @@ __all__ = [
     "strttf_raw",
     "stfttr_raw",
     "spfcon_raw",
+    # Low-level / power-user API — double precision
+    "dsfrk_raw",
+    "dsfr_raw",
+    "dsfr2_raw",
+    "dsfr2k_raw",
+    "dsfmm_raw",
+    "dpftrf_raw",
+    "dpftrs_raw",
+    "dpftri_raw",
+    "dsfmv_raw",
+    "dlansf_raw",
+    "dstrttf_raw",
+    "dstfttr_raw",
+    "dpfcon_raw",
     "Handle",
     # Integer enum constants
     "OP_N",

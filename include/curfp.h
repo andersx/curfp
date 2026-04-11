@@ -347,6 +347,202 @@ curfpStatus_t curfpSsfmm(
     int              ldc
 );
 
+/* ===========================================================================
+ * Double-precision (D-prefix) variants
+ * ===========================================================================*/
+
+/* ---------------------------------------------------------------------------
+ * curfpDsfrk — Symmetric Rank-K update in RFP format (double precision)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDsfrk(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    curfpOperation_t trans,
+    int              n,
+    int              k,
+    const double    *alpha,
+    const double    *A,
+    int              lda,
+    const double    *beta,
+    double          *C
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDpftrf — Cholesky factorization in RFP format (double precision)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDpftrf(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    double          *A,
+    int             *info
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDpftrs — Triangular solve using RFP Cholesky factor (double precision)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDpftrs(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    int              nrhs,
+    const double    *A,
+    double          *B,
+    int              ldb
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDstrttf — Copy triangular matrix from full format to RFP (double prec.)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDstrttf(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    const double    *A,
+    int              lda,
+    double          *arf
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDsfmv — Symmetric matrix-vector multiply in RFP format (double prec.)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDsfmv(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    const double    *alpha,
+    const double    *arf,
+    const double    *x,
+    int              incx,
+    const double    *beta,
+    double          *y,
+    int              incy
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDpftri — Compute inverse of SPD matrix from RFP Cholesky factor (d.p.)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDpftri(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    double          *arf
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDstfttr — Copy triangular matrix from RFP format to full (double prec.)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDstfttr(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    const double    *arf,
+    double          *A,
+    int              lda
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDlansf — Norm of a symmetric matrix in RFP format (double precision)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDlansf(
+    curfpHandle_t    handle,
+    curfpNormType_t  norm,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    const double    *arf,
+    double          *result
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDpfcon — Reciprocal condition number estimate from RFP Cholesky factor
+ *               (double precision).
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDpfcon(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    const double    *arf,
+    double           anorm,
+    double          *rcond
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDsfr — Symmetric Rank-1 update in RFP format (double precision)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDsfr(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    const double    *alpha,
+    const double    *x,
+    int              incx,
+    double          *arf
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDsfr2 — Symmetric Rank-2 update in RFP format (double precision)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDsfr2(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    int              n,
+    const double    *alpha,
+    const double    *x,
+    int              incx,
+    const double    *y,
+    int              incy,
+    double          *arf
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDsfr2k — Symmetric Rank-2K update in RFP format (double precision)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDsfr2k(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    curfpOperation_t trans,
+    int              n,
+    int              k,
+    const double    *alpha,
+    const double    *A,
+    int              lda,
+    const double    *B,
+    int              ldb,
+    const double    *beta,
+    double          *C
+);
+
+/* ---------------------------------------------------------------------------
+ * curfpDsfmm — Symmetric matrix-matrix multiply in RFP format (double prec.)
+ * ---------------------------------------------------------------------------*/
+curfpStatus_t curfpDsfmm(
+    curfpHandle_t    handle,
+    curfpOperation_t transr,
+    curfpFillMode_t  uplo,
+    curfpSideMode_t  side,
+    int              m,
+    int              n,
+    const double    *alpha,
+    const double    *arf,
+    const double    *B,
+    int              ldb,
+    const double    *beta,
+    double          *C,
+    int              ldc
+);
+
 #ifdef __cplusplus
 }
 #endif

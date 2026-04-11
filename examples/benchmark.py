@@ -22,6 +22,7 @@ Colour convention:
   Red   (#cb181d / #fb6a4a) — PyTorch / torch
 """
 
+import csv
 import ctypes
 
 import torch
@@ -1202,8 +1203,11 @@ C_PT_RED2 = "#fb6a4a"  # torch secondary
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # A100 80 GB — RFP float32 ceiling ~n=274k; dense OOMs expected above ~n=56k
+    # sizes = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 196608, 245760]
+    # H200 141 GB — RFP float32 ceiling ~n=375k; dense OOMs expected above ~n=100k
+    # sizes = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 196608, 262144, 327680, 360448]
     sizes = [1024, 2048, 4096, 8192, 16384, 32768, 56000, 65536, 80000]
-    # sizes = [1024, 2048, 4096, 8192, 16384]
     k = 1024
     nrhs = 64
     nrhs_mm = 1024  # wider nrhs for ssfmm to show matmul throughput advantage
@@ -1700,3 +1704,112 @@ if __name__ == "__main__":
     out = "benchmark.png"
     plt.savefig(out, dpi=150, bbox_inches="tight")
     print(f"\nPlot saved to {out}")
+
+    # -------------------------------------------------------------------------
+    # CSV export
+    # -------------------------------------------------------------------------
+    csv_out = "benchmark.csv"
+    with open(csv_out, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "n",
+                "ssfrk_rfp_ms",
+                "spftrf_rfp_ms",
+                "spftrs_rfp_ms",
+                "rfp_mem_gb",
+                "ssyrk_dns_ms",
+                "sgemm_cb_ms",
+                "sgemm_pt_ms",
+                "spotrf_cusolver_ms",
+                "cholesky_torch_ms",
+                "solve_torch_ms",
+                "dense_mem_gb",
+                "spftri_rfp_ms",
+                "spotri_cusolver_ms",
+                "inv_torch_ms",
+                "slansf_1_ms",
+                "slansf_F_ms",
+                "norm1_torch_ms",
+                "normF_torch_ms",
+                "ssfmv_rfp_ms",
+                "ssymv_cb_ms",
+                "sspmv_cb_ms",
+                "mv_torch_ms",
+                "strttf_rfp_ms",
+                "strttp_cb_ms",
+                "triu_torch_ms",
+                "stfttr_rfp_ms",
+                "stpttr_cb_ms",
+                "tril_torch_ms",
+                "spfcon_rfp_ms",
+                "cond_torch_ms",
+                "ssfr_rfp_ms",
+                "ssyr_cb_ms",
+                "addr_torch_ms",
+                "ssfr2_rfp_ms",
+                "ssyr2_cb_ms",
+                "addr2_torch_ms",
+                "ssfr2k_rfp_ms",
+                "ssyr2k_cb_ms",
+                "sgemm2_cb_ms",
+                "ssfmm_rfp_ms",
+                "ssymm_cb_ms",
+                "mm_torch_ms",
+            ]
+        )
+        # Build lookup dicts keyed by n
+        extra = {r[0]: r for r in extra_results}
+        new = {r[0]: r for r in new_results}
+        for r in pipeline_results:
+            n = r[0]
+            e = extra.get(n, [n] + [None] * 19)
+            nw = new.get(n, [n] + [None] * 12)
+            w.writerow(
+                [
+                    n,
+                    r[1],
+                    r[2],
+                    r[3],
+                    r[4],
+                    r[5],
+                    r[6],
+                    r[7],
+                    r[8],
+                    r[9],
+                    r[10],
+                    r[11],
+                    e[1],
+                    e[2],
+                    e[3],
+                    e[4],
+                    e[5],
+                    e[6],
+                    e[7],
+                    e[8],
+                    e[9],
+                    e[10],
+                    e[11],
+                    e[12],
+                    e[13],
+                    e[14],
+                    e[15],
+                    e[16],
+                    e[17],
+                    e[18],
+                    e[19],
+                    nw[1],
+                    nw[2],
+                    nw[3],
+                    nw[4],
+                    nw[5],
+                    nw[6],
+                    nw[7],
+                    nw[8],
+                    nw[9],
+                    nw[10],
+                    nw[11],
+                    nw[12],
+                ]
+            )
+    print(f"Timings saved to {csv_out}")

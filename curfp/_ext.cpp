@@ -393,6 +393,280 @@ void ssfmm(Handle  &handle,
 }
 
 /* =========================================================================
+ * Double-precision (D-prefix) wrappers
+ * =========================================================================*/
+
+void dsfrk(Handle  &handle,
+           int      transr,
+           int      uplo,
+           int      trans,
+           int      n,
+           int      k,
+           double   alpha,
+           int64_t  A_ptr,
+           int      lda,
+           double   beta,
+           int64_t  C_ptr)
+{
+    check_status(curfpDsfrk(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        static_cast<curfpOperation_t>(trans),
+        n, k,
+        &alpha, reinterpret_cast<const double *>(A_ptr), lda,
+        &beta,  reinterpret_cast<double *>(C_ptr)));
+}
+
+int dpftrf(Handle  &handle,
+           int      transr,
+           int      uplo,
+           int      n,
+           int64_t  A_ptr)
+{
+    int info = 0;
+    check_status(curfpDpftrf(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<double *>(A_ptr),
+        &info));
+    return info;
+}
+
+void dpftrs(Handle  &handle,
+            int      transr,
+            int      uplo,
+            int      n,
+            int      nrhs,
+            int64_t  A_ptr,
+            int64_t  B_ptr,
+            int      ldb)
+{
+    check_status(curfpDpftrs(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n, nrhs,
+        reinterpret_cast<const double *>(A_ptr),
+        reinterpret_cast<double *>(B_ptr),
+        ldb));
+}
+
+void dsfmv(Handle  &handle,
+           int      transr,
+           int      uplo,
+           int      n,
+           double   alpha,
+           int64_t  arf_ptr,
+           int64_t  x_ptr,
+           int      incx,
+           double   beta,
+           int64_t  y_ptr,
+           int      incy)
+{
+    check_status(curfpDsfmv(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        &alpha,
+        reinterpret_cast<const double *>(arf_ptr),
+        reinterpret_cast<const double *>(x_ptr),
+        incx,
+        &beta,
+        reinterpret_cast<double *>(y_ptr),
+        incy));
+}
+
+void dpftri(Handle  &handle,
+            int      transr,
+            int      uplo,
+            int      n,
+            int64_t  arf_ptr)
+{
+    check_status(curfpDpftri(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<double *>(arf_ptr)));
+}
+
+void dstrttf(Handle  &handle,
+             int      transr,
+             int      uplo,
+             int      n,
+             int64_t  A_ptr,
+             int      lda,
+             int64_t  arf_ptr)
+{
+    check_status(curfpDstrttf(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<const double *>(A_ptr),
+        lda,
+        reinterpret_cast<double *>(arf_ptr)));
+}
+
+void dstfttr(Handle  &handle,
+             int      transr,
+             int      uplo,
+             int      n,
+             int64_t  arf_ptr,
+             int64_t  A_ptr,
+             int      lda)
+{
+    check_status(curfpDstfttr(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<const double *>(arf_ptr),
+        reinterpret_cast<double *>(A_ptr),
+        lda));
+}
+
+double dlansf(Handle  &handle,
+              int      norm,
+              int      transr,
+              int      uplo,
+              int      n,
+              int64_t  arf_ptr)
+{
+    double result = 0.0;
+    check_status(curfpDlansf(
+        handle.get(),
+        static_cast<curfpNormType_t>(norm),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<const double *>(arf_ptr),
+        &result));
+    return result;
+}
+
+double dpfcon(Handle  &handle,
+              int      transr,
+              int      uplo,
+              int      n,
+              int64_t  arf_ptr,
+              double   anorm)
+{
+    double rcond = 0.0;
+    check_status(curfpDpfcon(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        reinterpret_cast<const double *>(arf_ptr),
+        anorm,
+        &rcond));
+    return rcond;
+}
+
+void dsfr(Handle  &handle,
+          int      transr,
+          int      uplo,
+          int      n,
+          double   alpha,
+          int64_t  x_ptr,
+          int      incx,
+          int64_t  arf_ptr)
+{
+    check_status(curfpDsfr(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        &alpha,
+        reinterpret_cast<const double *>(x_ptr),
+        incx,
+        reinterpret_cast<double *>(arf_ptr)));
+}
+
+void dsfr2(Handle  &handle,
+           int      transr,
+           int      uplo,
+           int      n,
+           double   alpha,
+           int64_t  x_ptr,
+           int      incx,
+           int64_t  y_ptr,
+           int      incy,
+           int64_t  arf_ptr)
+{
+    check_status(curfpDsfr2(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        n,
+        &alpha,
+        reinterpret_cast<const double *>(x_ptr),
+        incx,
+        reinterpret_cast<const double *>(y_ptr),
+        incy,
+        reinterpret_cast<double *>(arf_ptr)));
+}
+
+void dsfr2k(Handle  &handle,
+            int      transr,
+            int      uplo,
+            int      trans,
+            int      n,
+            int      k,
+            double   alpha,
+            int64_t  A_ptr,
+            int      lda,
+            int64_t  B_ptr,
+            int      ldb,
+            double   beta,
+            int64_t  C_ptr)
+{
+    check_status(curfpDsfr2k(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        static_cast<curfpOperation_t>(trans),
+        n, k,
+        &alpha,
+        reinterpret_cast<const double *>(A_ptr), lda,
+        reinterpret_cast<const double *>(B_ptr), ldb,
+        &beta,
+        reinterpret_cast<double *>(C_ptr)));
+}
+
+void dsfmm(Handle  &handle,
+           int      transr,
+           int      uplo,
+           int      side,
+           int      m,
+           int      n,
+           double   alpha,
+           int64_t  arf_ptr,
+           int64_t  B_ptr,
+           int      ldb,
+           double   beta,
+           int64_t  C_ptr,
+           int      ldc)
+{
+    check_status(curfpDsfmm(
+        handle.get(),
+        static_cast<curfpOperation_t>(transr),
+        static_cast<curfpFillMode_t>(uplo),
+        static_cast<curfpSideMode_t>(side),
+        m, n,
+        &alpha,
+        reinterpret_cast<const double *>(arf_ptr),
+        reinterpret_cast<const double *>(B_ptr), ldb,
+        &beta,
+        reinterpret_cast<double *>(C_ptr), ldc));
+}
+
+/* =========================================================================
  * Module
  * =========================================================================*/
 PYBIND11_MODULE(_curfp_C, m)
@@ -492,6 +766,99 @@ PYBIND11_MODULE(_curfp_C, m)
           py::arg("beta"),   py::arg("C_ptr"));
 
     m.def("ssfmm", &ssfmm,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"), py::arg("side"),
+          py::arg("m"),      py::arg("n"),
+          py::arg("alpha"),  py::arg("arf_ptr"),
+          py::arg("B_ptr"),  py::arg("ldb"),
+          py::arg("beta"),   py::arg("C_ptr"), py::arg("ldc"));
+
+    /* Double-precision bindings */
+    m.def("dsfrk",  &dsfrk,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"), py::arg("trans"),
+          py::arg("n"),      py::arg("k"),
+          py::arg("alpha"),  py::arg("A_ptr"), py::arg("lda"),
+          py::arg("beta"),   py::arg("C_ptr"));
+
+    m.def("dpftrf", &dpftrf,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),      py::arg("A_ptr"));
+
+    m.def("dpftrs", &dpftrs,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),      py::arg("nrhs"),
+          py::arg("A_ptr"),  py::arg("B_ptr"), py::arg("ldb"));
+
+    m.def("dsfmv", &dsfmv,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("alpha"),  py::arg("arf_ptr"),
+          py::arg("x_ptr"),  py::arg("incx"),
+          py::arg("beta"),   py::arg("y_ptr"), py::arg("incy"));
+
+    m.def("dpftri", &dpftri,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),      py::arg("arf_ptr"));
+
+    m.def("dstrttf", &dstrttf,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("A_ptr"),  py::arg("lda"),
+          py::arg("arf_ptr"));
+
+    m.def("dstfttr", &dstfttr,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("arf_ptr"),
+          py::arg("A_ptr"),  py::arg("lda"));
+
+    m.def("dlansf", &dlansf,
+          py::arg("handle"),
+          py::arg("norm"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("arf_ptr"));
+
+    m.def("dpfcon", &dpfcon,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("arf_ptr"),
+          py::arg("anorm"));
+
+    m.def("dsfr", &dsfr,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("alpha"),  py::arg("x_ptr"), py::arg("incx"),
+          py::arg("arf_ptr"));
+
+    m.def("dsfr2", &dsfr2,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"),
+          py::arg("n"),
+          py::arg("alpha"),
+          py::arg("x_ptr"),  py::arg("incx"),
+          py::arg("y_ptr"),  py::arg("incy"),
+          py::arg("arf_ptr"));
+
+    m.def("dsfr2k", &dsfr2k,
+          py::arg("handle"),
+          py::arg("transr"), py::arg("uplo"), py::arg("trans"),
+          py::arg("n"),      py::arg("k"),
+          py::arg("alpha"),
+          py::arg("A_ptr"),  py::arg("lda"),
+          py::arg("B_ptr"),  py::arg("ldb"),
+          py::arg("beta"),   py::arg("C_ptr"));
+
+    m.def("dsfmm", &dsfmm,
           py::arg("handle"),
           py::arg("transr"), py::arg("uplo"), py::arg("side"),
           py::arg("m"),      py::arg("n"),
