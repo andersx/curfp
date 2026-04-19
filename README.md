@@ -18,6 +18,10 @@ operate on matrices that would otherwise cause out-of-memory errors.
 
 LAPACK uses this format in routines like `ssfrk`, `spftrf`, and `spftrs`.
 
+I believe this is the original reference for from the inventors:
+Gustavson, F. G., Waśniewski, J., Dongarra, J. J., & Langou, J. (2008, April). *Rectangular Full Packed Format for Cholesky’s Algorithm: Factorization, Solution and Inversion* (LAPACK Working Note 199). Netlib / LAPACK. https://www.netlib.org/lapack/lawnspdf/lawn199.pdf
+
+
 ## Operations
 
 | Function | Description |
